@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ -x "$repo_root/target/debug/locker" ]; then
+  exec "$repo_root/target/debug/locker" "$@"
+fi
+
+exec cargo run --manifest-path "$repo_root/Cargo.toml" --quiet --bin locker -- "$@"

@@ -1,6 +1,6 @@
 # Artifact Catalog
 
-Artifact mirror for pentest workstation tooling.
+Artifact mirror and sync client for pentest workstation tooling.
 
 This repo tracks:
 
@@ -8,11 +8,14 @@ This repo tracks:
 - SHA256 checksums
 - staged release assets
 - simple publish tooling for public GitHub Releases
+- a Rust CLI/TUI that owns the workflow
 
 ## Layout
 
 ```text
 Artifact-Catalog/
+├── src/
+├── Cargo.toml
 ├── builds/
 ├── checksums/
 ├── manifests/
@@ -24,6 +27,8 @@ Artifact-Catalog/
 ## Source Of Truth
 
 `manifests/artifacts.yaml` is the catalog source of truth. It uses JSON-compatible YAML so it can be edited and validated without extra dependencies.
+
+The primary interface is the Rust `locker` app. Use `scripts/locker` as the stable entrypoint.
 
 Each artifact entry contains:
 
@@ -69,7 +74,7 @@ https://github.com/OWNER/REPO@<full-commit-sha>
 Example for a locally built Windows binary:
 
 ```bash
-scripts/add-artifact.sh /path/to/SweetPotato.exe \
+scripts/locker add /path/to/SweetPotato.exe \
   --platform windows \
   --category bin \
   --filename SweetPotato.exe \
@@ -119,7 +124,7 @@ Avoid:
 Example:
 
 ```bash
-scripts/add-artifact.sh /path/to/Rubeus.exe \
+scripts/locker add /path/to/Rubeus.exe \
   --platform windows \
   --category bin \
   --filename Rubeus-net48.exe \
@@ -130,23 +135,38 @@ scripts/add-artifact.sh /path/to/Rubeus.exe \
 
 ## Workflow
 
-### 1. Add a local artifact you already trust
+### CLI commands
 
 ```bash
-scripts/add-artifact.sh /path/to/file \
-  --platform windows \
-  --category bin \
-  --filename winpeas.exe \
-  --version 2025.01 \
-  --source-type local
+scripts/locker add /path/to/file
+scripts/locker list
+scripts/locker list --platform windows --synced false
+scripts/locker list --json
+scripts/locker show SweetPotato.exe
+scripts/locker show SweetPotato.exe --json
+scripts/locker verify
+scripts/locker doctor
+scripts/locker publish v2026-04-23
+scripts/locker sync
+scripts/locker tui
 ```
 
-This:
+The `add` flow:
 
 - copies the file into `staging/release-assets/`
 - computes SHA256
 - updates `manifests/artifacts.yaml`
 - rebuilds `checksums/sha256sums.txt`
+- infers `filename`, `source_type`, `source_ref`, and release `version` when possible
+- suggests `platform` and `category` from the filename
+- prompts for missing metadata unless you pass it directly
+- supports `-y/--yes` for fast non-interactive adds using inferred/default values
+
+If you already built the debug binary, you can run:
+
+```bash
+cargo run --bin locker -- add /path/to/file
+```
 
 The staged release asset is stored locally at:
 
@@ -159,7 +179,7 @@ That directory is intentionally gitignored, so the staged binaries do not show u
 ### 1b. Add directly from a GitHub release URL
 
 ```bash
-scripts/add-artifact.sh \
+scripts/locker add \
   https://github.com/OWNER/REPO/releases/download/v1.2.3/tool.exe \
   --platform windows \
   --category bin \
@@ -173,7 +193,7 @@ When the source is a URL and `--source-ref` is not provided, `source_ref` is aut
 ### 1c. Import from an existing GitHub release asset
 
 ```bash
-scripts/import-github-release.sh \
+scripts/locker add \
   https://github.com/OWNER/REPO/releases/download/v1.2.3/tool.exe \
   --platform windows \
   --category bin \
@@ -181,18 +201,30 @@ scripts/import-github-release.sh \
   --version v1.2.3
 ```
 
-This is a convenience wrapper around `add-artifact.sh` for GitHub release asset URLs. It also records the original GitHub release URL in `source_ref`.
+This is the same happy path as a generic URL add.
+
+### 1d. Browse and inspect
+
+```bash
+scripts/locker list --platform windows
+scripts/locker list --active true --synced false
+scripts/locker list --json
+scripts/locker show SweetPotato.exe
+scripts/locker show SweetPotato.exe --json
+```
+
+`list` now includes staged and synced state so you can see whether an artifact is only in the catalog, already staged, or already present in your local payload shelf.
 
 ### 2. Verify the catalog
 
 ```bash
-scripts/verify-artifacts.sh
+scripts/locker verify
 ```
 
 ### 3. Publish a release
 
 ```bash
-GITHUB_TOKEN=... scripts/publish-release.sh v2026-04-23
+GITHUB_TOKEN=... scripts/locker publish v2026-04-23
 ```
 
 Defaults:
@@ -202,18 +234,37 @@ Defaults:
 
 Override them if your GitHub repo uses a different owner or name.
 
+Storage backend defaults to GitHub Releases. The backend is now explicit:
+
+```bash
+LOCKER_BACKEND=github-releases
+```
+
+Future intent:
+
+- `github-releases` works now
+- `oci-registry` is reserved for a future Harbor/ORAS-style backend
+
 If publishing fails with HTTP `422`, the script now prints the GitHub API response body. Common causes are:
 
 - the repository has no initial commit/default branch yet
 - the token lacks `Contents: Read and write`
 - the release/tag already exists in an invalid state
 
-### 4. Use it from `OSCP-Automation`
-
-`OSCP-Automation/bin/refresh-payloads.sh` now pulls from this mirror by default:
+### 4. Sync it locally
 
 ```bash
-refresh-payloads
+scripts/locker sync
+scripts/locker sync --platform windows
+scripts/locker sync --category bin
+scripts/locker sync --only SweetPotato.exe
+scripts/locker sync --dry-run
+```
+
+Synced files land under `~/tools/payloads/` by default, with metadata written to:
+
+```text
+~/tools/payloads/.locker/artifacts.json
 ```
 
 Useful overrides:
@@ -230,4 +281,17 @@ ARTIFACT_CATALOG_CHECKSUMS_URL=https://github.com/CameronCandau/Artifact-Catalog
 
 - Release assets are published with deterministic names: `platform--category--filename`
 - `artifacts.yaml` and `sha256sums.txt` are also uploaded as release assets
+- `locker tui` can now search, reload, sync, verify, open an action menu, copy values to the clipboard, and show progress in the footer:
+  - `/` search by filename
+  - `Esc` clear the current filter
+  - `s` sync the selected artifact
+  - `S` sync the current filtered view
+  - `v` verify the catalog
+  - `Enter` open an action menu for the selected artifact
+  - `R` reload manifest and local metadata
+  - `a` toggle active
+  - `y` filename
+  - `p` synced or staged path
+  - `u` source ref
+  - `r` resolved download URL
 - V1 keeps containerized builds out of the critical path; see `builds/README.md`

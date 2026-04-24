@@ -47,6 +47,17 @@
     {
       "platform": "windows",
       "category": "bin",
+      "filename": "ligolo-ng_agent_0.8.3_windows_amd64.exe",
+      "version": "v0.8.3",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/nicocha30/ligolo-ng/releases/download/v0.8.3/ligolo-ng_agent_0.8.3_windows_amd64.zip",
+      "sha256": "4b41f36f82db6da8767a0a1c2997c8242d80b2d10a8f1d28c252a9306ec152b5",
+      "release_asset_name": "windows--bin--ligolo-ng_agent_0.8.3_windows_amd64.exe",
+      "active": true
+    },
+    {
+      "platform": "windows",
+      "category": "bin",
       "filename": "winPEASx64.exe",
       "version": "20260422-9567fd62",
       "source_type": "github-release",

@@ -5,7 +5,7 @@ Containerized builders are intentionally deferred from the V1 critical path.
 The current workflow assumes you either:
 
 - add local artifacts you already have on disk, or
-- download/build them elsewhere and then ingest them with `scripts/add-artifact.sh`
+- download/build them elsewhere and then ingest them with `scripts/locker add`
 
 ## Future Direction
 

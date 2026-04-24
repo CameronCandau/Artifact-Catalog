@@ -1,2 +1,3 @@
 staging/release-assets/*
 !staging/release-assets/.gitkeep
+target/
