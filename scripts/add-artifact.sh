@@ -4,17 +4,23 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  add-artifact.sh <source_path> --name NAME --platform PLATFORM --category CATEGORY \
+  add-artifact.sh <source_path_or_url> --platform PLATFORM --category CATEGORY \
     --filename FILENAME --version VERSION [--source-type TYPE] [--source-ref REF] [--inactive]
 
 Examples:
   add-artifact.sh /path/to/winpeas.exe \
-    --name winpeas \
     --platform windows \
     --category bin \
     --filename winpeas.exe \
     --version 2025.01 \
     --source-type local
+
+  add-artifact.sh https://github.com/OWNER/REPO/releases/download/v1.2.3/tool.exe \
+    --platform windows \
+    --category bin \
+    --filename tool.exe \
+    --version v1.2.3 \
+    --source-type github-release
 EOF
 }
 
@@ -27,16 +33,23 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest_path="$repo_root/manifests/artifacts.yaml"
 checksums_path="$repo_root/checksums/sha256sums.txt"
 release_dir="$repo_root/staging/release-assets"
+tmpdir=""
 
 [ "$#" -ge 1 ] || {
   usage >&2
   exit 1
 }
 
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 source_path="$1"
 shift
 
-name=""
 platform=""
 category=""
 filename=""
@@ -47,10 +60,6 @@ active="true"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --name)
-      name="$2"
-      shift 2
-      ;;
     --platform)
       platform="$2"
       shift 2
@@ -90,8 +99,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ -f "$source_path" ] || fail "Source file not found: $source_path"
-[ -n "$name" ] || fail "--name is required"
 [ -n "$platform" ] || fail "--platform is required"
 [ -n "$category" ] || fail "--category is required"
 [ -n "$filename" ] || fail "--filename is required"
@@ -104,34 +111,47 @@ case "$platform" in
     ;;
 esac
 
-if [ -z "$source_ref" ]; then
-  source_ref="$(realpath "$source_path")"
+if [[ "$source_path" =~ ^https?:// ]]; then
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  download_path="$tmpdir/source"
+  printf '[+] Downloading %s\n' "$source_path"
+  curl -fsSL --retry 2 --retry-delay 2 "$source_path" -o "$download_path"
+  source_file="$download_path"
+  if [ -z "$source_ref" ]; then
+    source_ref="$source_path"
+  fi
+else
+  [ -f "$source_path" ] || fail "Source file not found: $source_path"
+  source_file="$source_path"
+  if [ -z "$source_ref" ]; then
+    source_ref="$(realpath "$source_path")"
+  fi
 fi
 
 mkdir -p "$release_dir"
 
 release_asset_name="${platform}--${category}--${filename}"
 dest_path="$release_dir/$release_asset_name"
-cp "$source_path" "$dest_path"
+cp "$source_file" "$dest_path"
 sha256="$(sha256sum "$dest_path" | awk '{print $1}')"
 
-python3 - "$manifest_path" "$name" "$platform" "$category" "$filename" "$version" "$source_type" "$source_ref" "$sha256" "$release_asset_name" "$active" <<'PY'
+python3 - "$manifest_path" "$platform" "$category" "$filename" "$version" "$source_type" "$source_ref" "$sha256" "$release_asset_name" "$active" <<'PY'
 import json
 import pathlib
 import sys
 
 manifest_path = pathlib.Path(sys.argv[1])
 entry = {
-    "name": sys.argv[2],
-    "platform": sys.argv[3],
-    "category": sys.argv[4],
-    "filename": sys.argv[5],
-    "version": sys.argv[6],
-    "source_type": sys.argv[7],
-    "source_ref": sys.argv[8],
-    "sha256": sys.argv[9],
-    "release_asset_name": sys.argv[10],
-    "active": sys.argv[11].lower() == "true",
+    "platform": sys.argv[2],
+    "category": sys.argv[3],
+    "filename": sys.argv[4],
+    "version": sys.argv[5],
+    "source_type": sys.argv[6],
+    "source_ref": sys.argv[7],
+    "sha256": sys.argv[8],
+    "release_asset_name": sys.argv[9],
+    "active": sys.argv[10].lower() == "true",
 }
 
 if manifest_path.exists():

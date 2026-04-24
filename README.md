@@ -27,7 +27,6 @@ Artifact-Catalog/
 
 Each artifact entry contains:
 
-- `name`
 - `platform`
 - `category`
 - `filename`
@@ -71,7 +70,6 @@ Example for a locally built Windows binary:
 
 ```bash
 scripts/add-artifact.sh /path/to/SweetPotato.exe \
-  --name sweetpotato \
   --platform windows \
   --category bin \
   --filename SweetPotato.exe \
@@ -80,13 +78,62 @@ scripts/add-artifact.sh /path/to/SweetPotato.exe \
   --source-ref https://github.com/CCob/SweetPotato@a1b2c3d4e5f678901234567890abcdef12345678
 ```
 
+## Variant Naming Convention
+
+For compatibility-sensitive tools, treat framework and architecture variants as separate curated artifacts.
+
+Do not model this as one artifact with many loosely tracked versions. Model it as a small set of explicit filenames.
+
+Recommended naming pattern:
+
+- `<tool>-net48`
+- `<tool>-net35`
+- `<tool>-net20`
+- `<tool>-x64`
+- `<tool>-x86`
+- combine when needed: `<tool>-net48-x64`
+
+Recommended filename pattern:
+
+- `Rubeus-net48.exe`
+- `Rubeus-net35.exe`
+- `Seatbelt-net48.exe`
+
+Recommended version pattern for built variants:
+
+- `git-<shortsha>-net48-x64`
+- `git-<shortsha>-net35-x64`
+
+Practical rule:
+
+- keep one primary modern build
+- keep one legacy compatibility build if you actually need it
+- add more variants only when they solve a real target-driven problem
+
+Avoid:
+
+- mirroring every historical version
+- keeping many near-identical binaries with unclear naming
+- using one filename to represent multiple framework variants
+
+Example:
+
+```bash
+scripts/add-artifact.sh /path/to/Rubeus.exe \
+  --platform windows \
+  --category bin \
+  --filename Rubeus-net48.exe \
+  --version git-a1b2c3d-net48-x64 \
+  --source-type built \
+  --source-ref https://github.com/Flangvik/SharpCollection@a1b2c3d4e5f678901234567890abcdef12345678
+```
+
 ## Workflow
 
 ### 1. Add a local artifact you already trust
 
 ```bash
 scripts/add-artifact.sh /path/to/file \
-  --name winpeas \
   --platform windows \
   --category bin \
   --filename winpeas.exe \
@@ -109,19 +156,32 @@ staging/release-assets/<platform>--<category>--<filename>
 
 That directory is intentionally gitignored, so the staged binaries do not show up in normal git status output.
 
-### 1b. Import from an existing GitHub release asset
+### 1b. Add directly from a GitHub release URL
+
+```bash
+scripts/add-artifact.sh \
+  https://github.com/OWNER/REPO/releases/download/v1.2.3/tool.exe \
+  --platform windows \
+  --category bin \
+  --filename tool.exe \
+  --version v1.2.3 \
+  --source-type github-release
+```
+
+When the source is a URL and `--source-ref` is not provided, `source_ref` is automatically set to the exact URL you passed.
+
+### 1c. Import from an existing GitHub release asset
 
 ```bash
 scripts/import-github-release.sh \
   https://github.com/OWNER/REPO/releases/download/v1.2.3/tool.exe \
-  --name tool \
   --platform windows \
   --category bin \
   --filename tool.exe \
   --version v1.2.3
 ```
 
-This downloads the release asset locally, stages it into `staging/release-assets/`, and records the original GitHub release URL in `source_ref`.
+This is a convenience wrapper around `add-artifact.sh` for GitHub release asset URLs. It also records the original GitHub release URL in `source_ref`.
 
 ### 2. Verify the catalog
 
