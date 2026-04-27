@@ -1,14 +1,16 @@
 # Artifact Catalog
 
-Artifact mirror and sync client for pentest workstation tooling.
+`artifact-catalog` is a CLI for managing a small curated set of pentest and
+red-team artifacts. It tracks artifact metadata, checksums, staged release
+assets, and local sync state.
 
 This repo tracks:
 
-- approved artifacts and their metadata
+- artifact metadata
 - SHA256 checksums
 - staged release assets
-- simple publish tooling for public GitHub Releases
-- a Rust CLI/TUI that owns the workflow
+- publish tooling for GitHub Releases or OCI registries
+- a Rust CLI/TUI for managing the catalog
 
 ## Layout
 
@@ -28,7 +30,26 @@ Artifact-Catalog/
 
 `manifests/artifacts.yaml` is the catalog source of truth. It uses JSON-compatible YAML so it can be edited and validated without extra dependencies.
 
-The primary interface is the Rust `locker` app. Use `scripts/locker` as the stable entrypoint.
+Use `artifact-catalog` when you want to:
+
+- keep a checked and versioned list of approved assessment artifacts
+- stage artifacts for release publication
+- publish catalog contents to GitHub Releases or an OCI registry
+- sync the published catalog into a local working directory
+
+The primary interface is the Rust `locker` CLI.
+
+For contributors inside this repo, `scripts/locker` is the easiest entrypoint.
+For installed use, `locker` supports a default catalog root under
+`$XDG_DATA_HOME/artifact-catalog` (falling back to
+`~/.local/share/artifact-catalog`).
+
+Catalog root precedence is:
+
+1. `--root <PATH>`
+2. `LOCKER_ROOT`
+3. a detected repo checkout
+4. the XDG default root
 
 Each artifact entry contains:
 
@@ -65,11 +86,13 @@ Avoid vague values like:
 - `custom`
 - `x64`
 
-For source-built artifacts, keep the provenance in `source_ref` too:
+For source-built artifacts, prefer keeping commit-pinned provenance in `source_ref`:
 
 ```text
 https://github.com/OWNER/REPO@<full-commit-sha>
 ```
+
+Older catalog entries may still need provenance backfill; use the pinned form for new or refreshed built artifacts.
 
 Example for a locally built Windows binary:
 
@@ -133,11 +156,51 @@ scripts/locker add /path/to/Rubeus.exe \
   --source-ref https://github.com/Flangvik/SharpCollection@a1b2c3d4e5f678901234567890abcdef12345678
 ```
 
+## Scope
+
+The catalog is meant to stay small and explicit rather than mirror everything.
+Typical entries include:
+
+- third-party release assets mirrored with checksums
+- internally built artifacts with pinned provenance
+- scripts and other transferable text assets
+- compatibility-specific variants where filename and versioning matter
+
+General curation rules:
+
+- prefer official upstream releases when they exist
+- use `built` with pinned commit provenance when you compile artifacts locally
+- keep variants explicit in filenames when compatibility matters
+- treat scripts as first-class artifacts with `category: scripts`
+
 ## Workflow
+
+### Install and initialize
+
+Contributor workflow:
+
+```bash
+scripts/locker init
+```
+
+Installed CLI workflow:
+
+```bash
+cargo install artifact-catalog
+locker init
+```
+
+Use an explicit root when you want a portable project directory instead of the
+default XDG location:
+
+```bash
+locker --root /path/to/catalog init
+```
 
 ### CLI commands
 
 ```bash
+scripts/locker init
 scripts/locker add /path/to/file
 scripts/locker list
 scripts/locker list --platform windows --synced false
@@ -240,10 +303,23 @@ Storage backend defaults to GitHub Releases. The backend is now explicit:
 LOCKER_BACKEND=github-releases
 ```
 
-Future intent:
+OCI registry backend:
 
-- `github-releases` works now
-- `oci-registry` is reserved for a future Harbor/ORAS-style backend
+```bash
+LOCKER_BACKEND=oci-registry
+ARTIFACT_CATALOG_OCI_REPOSITORY=public.ecr.aws/your-alias/artifact-catalog
+scripts/locker publish v2026-04-23
+```
+
+OCI backend notes:
+
+- `oras` must be installed and on `PATH`
+- authenticate separately if your registry requires it, for example `oras login ...`
+- each staged artifact is published to the configured OCI repository with tag `release_asset_name`
+- `artifacts.yaml` is published under tag `artifacts-manifest`
+- `sha256sums.txt` is published under tag `artifacts-sha256sums`
+- `resolve-url` returns `oci://...` references when `LOCKER_BACKEND=oci-registry`
+- set `ARTIFACT_CATALOG_OCI_PLAIN_HTTP=true` only for insecure local registries
 
 If publishing fails with HTTP `422`, the script now prints the GitHub API response body. Common causes are:
 
@@ -277,10 +353,20 @@ ARTIFACT_CATALOG_MANIFEST_URL=https://github.com/CameronCandau/Artifact-Catalog/
 ARTIFACT_CATALOG_CHECKSUMS_URL=https://github.com/CameronCandau/Artifact-Catalog/releases/latest/download/sha256sums.txt
 ```
 
+Useful OCI overrides:
+
+```bash
+ARTIFACT_CATALOG_OCI_REPOSITORY=public.ecr.aws/your-alias/artifact-catalog
+ARTIFACT_CATALOG_OCI_MANIFEST_TAG=artifacts-manifest
+ARTIFACT_CATALOG_OCI_CHECKSUMS_TAG=artifacts-sha256sums
+ARTIFACT_CATALOG_OCI_PLAIN_HTTP=false
+```
+
 ## Notes
 
+- `locker init` scaffolds `manifests/`, `checksums/`, and `staging/release-assets/` under the selected catalog root
 - Release assets are published with deterministic names: `platform--category--filename`
-- `artifacts.yaml` and `sha256sums.txt` are also uploaded as release assets
+- `artifacts.yaml` and `sha256sums.txt` are published alongside staged assets on both backends
 - `locker tui` can now search, reload, sync, verify, open an action menu, copy values to the clipboard, and show progress in the footer:
   - `/` search by filename
   - `Esc` clear the current filter
@@ -293,5 +379,5 @@ ARTIFACT_CATALOG_CHECKSUMS_URL=https://github.com/CameronCandau/Artifact-Catalog
   - `y` filename
   - `p` synced or staged path
   - `u` source ref
-  - `r` resolved download URL
+  - `r` resolved download URL or `oci://` reference
 - V1 keeps containerized builds out of the critical path; see `builds/README.md`

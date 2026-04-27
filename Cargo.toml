@@ -2,6 +2,26 @@
 name = "artifact-catalog"
 version = "0.1.0"
 edition = "2024"
+description = "Curated artifact catalog CLI for staging, verifying, publishing, and syncing operator tooling"
+readme = "README.md"
+license-file = "LICENSE"
+repository = "https://github.com/CameronCandau/Artifact-Catalog"
+homepage = "https://github.com/CameronCandau/Artifact-Catalog"
+documentation = "https://docs.rs/artifact-catalog"
+keywords = ["cli", "artifacts", "catalog", "release", "security"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "src/**",
+    "builds/README.md",
+    "checksums/sha256sums.txt",
+    "manifests/artifacts.yaml",
+    "scripts/locker",
+    "staging/release-assets/.gitkeep",
+]
 
 [[bin]]
 name = "locker"

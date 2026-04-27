@@ -19,8 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    env, fs,
-    io,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -32,12 +31,15 @@ use std::{
 #[command(name = "locker")]
 #[command(about = "Curated artifact locker for publishing, syncing, and browsing tool artifacts")]
 struct Cli {
+    #[arg(long, global = true, value_name = "PATH")]
+    root: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    Init,
     Add(AddArgs),
     List(ListArgs),
     Show(ShowArgs),
@@ -178,24 +180,67 @@ struct RepoPaths {
 }
 
 impl RepoPaths {
-    fn discover() -> Result<Self> {
-        let cwd = env::current_dir().context("could not determine current directory")?;
-        let root = if cwd.join("manifests/artifacts.yaml").exists() {
-            cwd
+    fn discover(root_override: Option<&Path>) -> Result<Self> {
+        let root = if let Some(root) = root_override {
+            root.to_path_buf()
+        } else if let Ok(root) = env::var("LOCKER_ROOT") {
+            PathBuf::from(root)
+        } else if let Some(root) = repo_checkout_root()? {
+            root
         } else {
-            env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .filter(|p| p.join("manifests/artifacts.yaml").exists())
-                .ok_or_else(|| anyhow!("run inside artifact-catalog repo or from installed binary"))?
+            default_catalog_root()
         };
-        Ok(Self {
+        Ok(Self::from_root(root))
+    }
+
+    fn from_root(root: PathBuf) -> Self {
+        Self {
             manifest: root.join("manifests/artifacts.yaml"),
             checksums: root.join("checksums/sha256sums.txt"),
             release_dir: root.join("staging/release-assets"),
             root,
-        })
+        }
+    }
+
+    fn ensure_layout(&self) -> Result<()> {
+        fs::create_dir_all(self.manifest_parent()?)?;
+        fs::create_dir_all(self.checksums_parent()?)?;
+        fs::create_dir_all(&self.release_dir)?;
+        Ok(())
+    }
+
+    fn init_if_missing(&self) -> Result<()> {
+        self.ensure_layout()?;
+        if !self.manifest.exists() {
+            save_manifest(self, &Manifest { artifacts: vec![] })?;
+        }
+        if !self.checksums.exists() {
+            fs::write(&self.checksums, "")?;
+        }
+        Ok(())
+    }
+
+    fn ensure_initialized(&self) -> Result<()> {
+        if self.manifest.exists() && self.checksums.exists() {
+            return Ok(());
+        }
+        bail!(
+            "locker catalog is not initialized at {}. Run `locker --root {} init` or set LOCKER_ROOT to an existing catalog root.",
+            self.root.display(),
+            self.root.display()
+        );
+    }
+
+    fn manifest_parent(&self) -> Result<&Path> {
+        self.manifest
+            .parent()
+            .ok_or_else(|| anyhow!("manifest path has no parent"))
+    }
+
+    fn checksums_parent(&self) -> Result<&Path> {
+        self.checksums
+            .parent()
+            .ok_or_else(|| anyhow!("checksums path has no parent"))
     }
 }
 
@@ -285,6 +330,10 @@ trait SyncBackend {
 struct GithubReleasesBackend;
 struct OciRegistryBackend;
 
+const OCI_ARTIFACT_TYPE_FILE: &str = "application/vnd.artifact-catalog.file.v1";
+const OCI_ARTIFACT_TYPE_MANIFEST: &str = "application/vnd.artifact-catalog.manifest.v1";
+const OCI_ARTIFACT_TYPE_CHECKSUMS: &str = "application/vnd.artifact-catalog.checksums.v1";
+
 fn github_owner() -> String {
     env::var("ARTIFACT_CATALOG_OWNER")
         .or_else(|_| env::var("GITHUB_OWNER"))
@@ -315,6 +364,136 @@ fn github_manifest_url() -> String {
 fn github_checksums_url() -> String {
     env::var("ARTIFACT_CATALOG_CHECKSUMS_URL")
         .unwrap_or_else(|_| format!("{}/sha256sums.txt", github_base_url()))
+}
+
+fn oci_repository() -> Result<String> {
+    env::var("ARTIFACT_CATALOG_OCI_REPOSITORY")
+        .or_else(|_| env::var("OCI_REPOSITORY"))
+        .map_err(|_| {
+            anyhow!(
+                "OCI repository is required; set ARTIFACT_CATALOG_OCI_REPOSITORY or OCI_REPOSITORY (example: public.ecr.aws/alias/artifact-catalog)"
+            )
+        })
+}
+
+fn oci_manifest_tag() -> String {
+    env::var("ARTIFACT_CATALOG_OCI_MANIFEST_TAG")
+        .or_else(|_| env::var("OCI_MANIFEST_TAG"))
+        .unwrap_or_else(|_| "artifacts-manifest".into())
+}
+
+fn oci_checksums_tag() -> String {
+    env::var("ARTIFACT_CATALOG_OCI_CHECKSUMS_TAG")
+        .or_else(|_| env::var("OCI_CHECKSUMS_TAG"))
+        .unwrap_or_else(|_| "artifacts-sha256sums".into())
+}
+
+fn oci_plain_http() -> bool {
+    env_truthy("ARTIFACT_CATALOG_OCI_PLAIN_HTTP") || env_truthy("OCI_PLAIN_HTTP")
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn oci_reference(tag: &str) -> Result<String> {
+    Ok(format!(
+        "{}:{}",
+        oci_repository()?.trim_end_matches('/'),
+        tag
+    ))
+}
+
+fn oci_resolved_url(tag: &str) -> Result<String> {
+    Ok(format!("oci://{}", oci_reference(tag)?))
+}
+
+fn ensure_oras_available() -> Result<()> {
+    let output = Command::new("oras").arg("version").output();
+    match output {
+        Ok(result) if result.status.success() => Ok(()),
+        Ok(result) => bail!(
+            "oras is required for the OCI backend: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        ),
+        Err(err) => bail!("oras is required for the OCI backend: {err}"),
+    }
+}
+
+fn oras_base_command() -> Result<Command> {
+    ensure_oras_available()?;
+    let mut command = Command::new("oras");
+    if oci_plain_http() {
+        command.arg("--plain-http");
+    }
+    Ok(command)
+}
+
+fn run_oras(repo_root: &Path, args: &[String]) -> Result<String> {
+    let mut command = oras_base_command()?;
+    let output = command
+        .current_dir(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("running oras {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn layer_media_type_for(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".ps1")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".json")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".py")
+    {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn temp_work_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+fn load_remote_oci_manifest() -> Result<Manifest> {
+    let tmpdir = temp_work_dir("locker-oci-manifest");
+    fs::create_dir_all(&tmpdir)?;
+    let reference = oci_reference(&oci_manifest_tag())?;
+    let pull_args = vec![
+        "pull".to_string(),
+        "--output".to_string(),
+        tmpdir.display().to_string(),
+        reference.clone(),
+    ];
+    let result = (|| {
+        run_oras(&tmpdir, &pull_args)?;
+        let path = tmpdir.join("artifacts.yaml");
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("reading pulled OCI manifest file from {}", reference))?;
+        serde_json::from_str(&raw).context("parsing pulled OCI manifest")
+    })();
+    let _ = fs::remove_dir_all(&tmpdir);
+    result
 }
 
 impl PublishBackend for GithubReleasesBackend {
@@ -414,7 +593,9 @@ impl PublishBackend for GithubReleasesBackend {
         }
 
         for (asset_name, path) in files {
-            if let Some(existing) = assets.iter().find(|a| a["name"].as_str() == Some(&asset_name))
+            if let Some(existing) = assets
+                .iter()
+                .find(|a| a["name"].as_str() == Some(&asset_name))
             {
                 if let Some(id) = existing["id"].as_u64() {
                     client
@@ -464,12 +645,14 @@ impl SyncBackend for GithubReleasesBackend {
     }
 
     fn resolve_url(&self, filename: &str, platform: Option<&str>) -> Result<String> {
-        let repo = RepoPaths::discover()?;
+        let repo = RepoPaths::discover(None)?;
         let manifest = load_manifest(&repo)?;
         let artifact = manifest
             .artifacts
             .into_iter()
-            .find(|a| a.filename == filename && a.active && platform.is_none_or(|p| a.platform == p))
+            .find(|a| {
+                a.filename == filename && a.active && platform.is_none_or(|p| a.platform == p)
+            })
             .ok_or_else(|| anyhow!("artifact not found: {filename}"))?;
         Ok(format!(
             "{}/{}",
@@ -480,27 +663,210 @@ impl SyncBackend for GithubReleasesBackend {
 }
 
 impl PublishBackend for OciRegistryBackend {
-    fn publish(&self, _repo: &RepoPaths, _manifest: &Manifest, _args: &PublishArgs) -> Result<()> {
-        bail!(
-            "OCI backend is not implemented yet. Keep using GitHub Releases now; Harbor/ORAS can slot in later."
-        )
+    fn publish(&self, repo: &RepoPaths, _manifest: &Manifest, _args: &PublishArgs) -> Result<()> {
+        let repository = oci_repository()?;
+        let staged_count = fs::read_dir(&repo.release_dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .count();
+        let total = staged_count + 2;
+        let mut files = vec![
+            (
+                oci_manifest_tag(),
+                repo.manifest.clone(),
+                OCI_ARTIFACT_TYPE_MANIFEST,
+                "artifacts.yaml".to_string(),
+            ),
+            (
+                oci_checksums_tag(),
+                repo.checksums.clone(),
+                OCI_ARTIFACT_TYPE_CHECKSUMS,
+                "sha256sums.txt".to_string(),
+            ),
+        ];
+        for entry in fs::read_dir(&repo.release_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| anyhow!("invalid staged asset name"))?
+                    .to_string();
+                files.push((name.clone(), path, OCI_ARTIFACT_TYPE_FILE, name));
+            }
+        }
+
+        println!("[+] Publishing OCI artifacts to {repository}");
+        for (idx, (tag, path, artifact_type, layer_name)) in files.into_iter().enumerate() {
+            let reference = oci_reference(&tag)?;
+            let layer_spec = format!("{}:{}", path.display(), layer_media_type_for(&layer_name));
+            let args = vec![
+                "push".to_string(),
+                "--artifact-type".to_string(),
+                artifact_type.to_string(),
+                reference.clone(),
+                layer_spec,
+            ];
+            println!("[+] Uploading {}/{}: {}", idx + 1, total, tag);
+            run_oras(&repo.root, &args)?;
+            println!("[+] Published {reference}");
+        }
+        println!("[+] OCI catalog ready under {repository}");
+        Ok(())
     }
 }
 
 impl SyncBackend for OciRegistryBackend {
-    fn sync(&self, _payloads: &PayloadPaths, _args: &SyncArgs) -> Result<()> {
-        bail!("OCI sync backend is not implemented yet.")
+    fn sync(&self, payloads: &PayloadPaths, args: &SyncArgs) -> Result<()> {
+        payloads.ensure_dirs()?;
+        let manifest = load_remote_oci_manifest()?;
+        let total_available = manifest.artifacts.len();
+        let mut artifacts: Vec<Artifact> = manifest
+            .artifacts
+            .into_iter()
+            .filter(|artifact| artifact.active)
+            .filter(|artifact| {
+                args.platform
+                    .as_ref()
+                    .is_none_or(|platform| &artifact.platform == platform)
+            })
+            .filter(|artifact| {
+                args.category
+                    .as_ref()
+                    .is_none_or(|category| &artifact.category == category)
+            })
+            .filter(|artifact| {
+                args.only_filename
+                    .as_ref()
+                    .is_none_or(|name| &artifact.filename == name)
+            })
+            .collect();
+        artifacts.sort_by(|a, b| {
+            (&a.platform, &a.category, &a.filename).cmp(&(&b.platform, &b.category, &b.filename))
+        });
+
+        let total = artifacts.len();
+        if total == 0 {
+            if let Some(name) = &args.only_filename {
+                println!("[+] no active OCI artifacts matched filename filter: {name}");
+            } else if let Some(platform) = &args.platform {
+                println!("[+] no active OCI artifacts matched platform filter: {platform}");
+            } else if let Some(category) = &args.category {
+                println!("[+] no active OCI artifacts matched category filter: {category}");
+            } else {
+                println!(
+                    "[+] no active OCI artifacts found in remote manifest ({total_available} total entries)"
+                );
+            }
+            return Ok(());
+        }
+
+        let mut metadata =
+            load_local_metadata(payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (idx, artifact) in artifacts.into_iter().enumerate() {
+            let step = idx + 1;
+            let dest_path = payloads.destination_for(&artifact)?;
+            let reference = oci_reference(&artifact.release_asset_name)?;
+            println!(
+                "[+] syncing {step}/{total}: {} -> {}",
+                artifact.filename,
+                dest_path.display()
+            );
+
+            if args.dry_run {
+                continue;
+            }
+
+            let tmpdir = temp_work_dir("locker-oci-pull");
+            fs::create_dir_all(&tmpdir)?;
+            let pull_args = vec![
+                "pull".to_string(),
+                "--output".to_string(),
+                tmpdir.display().to_string(),
+                reference.clone(),
+            ];
+            run_oras(&tmpdir, &pull_args).map_err(|err| {
+                let _ = fs::remove_dir_all(&tmpdir);
+                err
+            })?;
+            let pulled_path = tmpdir.join(&artifact.filename);
+            let digest = sha256_hex(&pulled_path).map_err(|err| {
+                let _ = fs::remove_dir_all(&tmpdir);
+                err
+            })?;
+            if digest != artifact.sha256 {
+                let _ = fs::remove_dir_all(&tmpdir);
+                bail!(
+                    "SHA256 mismatch for {}: expected {}, got {}",
+                    artifact.filename,
+                    artifact.sha256,
+                    digest
+                );
+            }
+
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&pulled_path, &dest_path)?;
+            if should_be_executable(&artifact.filename) {
+                make_executable(&dest_path)?;
+            }
+            let _ = fs::remove_dir_all(&tmpdir);
+
+            upsert_local_metadata(
+                &mut metadata,
+                LocalArtifactRecord {
+                    filename: artifact.filename.clone(),
+                    platform: artifact.platform.clone(),
+                    category: artifact.category.clone(),
+                    version: artifact.version.clone(),
+                    source_type: artifact.source_type.clone(),
+                    source_ref: artifact.source_ref.clone(),
+                    sha256: artifact.sha256.clone(),
+                    release_asset_name: artifact.release_asset_name.clone(),
+                    local_path: dest_path.display().to_string(),
+                    synced_at_epoch: now,
+                },
+            );
+            println!("[+] synced {step}/{total}: {}", artifact.filename);
+        }
+
+        if !args.dry_run {
+            save_local_metadata(payloads, &metadata)?;
+        }
+
+        println!("[+] OCI sync complete ({total} artifact(s))");
+        Ok(())
     }
 
-    fn resolve_url(&self, _filename: &str, _platform: Option<&str>) -> Result<String> {
-        bail!("resolve-url for oci backend is not implemented yet")
+    fn resolve_url(&self, filename: &str, platform: Option<&str>) -> Result<String> {
+        let repo = RepoPaths::discover(None)?;
+        let manifest = load_manifest(&repo)?;
+        let artifact = manifest
+            .artifacts
+            .into_iter()
+            .find(|a| {
+                a.filename == filename && a.active && platform.is_none_or(|p| a.platform == p)
+            })
+            .ok_or_else(|| anyhow!("artifact not found: {filename}"))?;
+        oci_resolved_url(&artifact.release_asset_name)
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo = RepoPaths::discover()?;
+    let repo = RepoPaths::discover(cli.root.as_deref())?;
+    unsafe {
+        env::set_var("LOCKER_ROOT", &repo.root);
+    }
     match cli.command {
+        Commands::Init => init_command(&repo),
         Commands::Add(args) => add_command(&repo, args),
         Commands::List(args) => list_command(&repo, &args),
         Commands::Show(args) => show_command(&repo, &args),
@@ -528,12 +894,17 @@ fn backend_sync() -> Box<dyn SyncBackend> {
 }
 
 fn load_manifest(repo: &RepoPaths) -> Result<Manifest> {
+    repo.ensure_initialized()?;
     let raw = fs::read_to_string(&repo.manifest).context("reading manifest")?;
     Ok(serde_json::from_str(&raw).context("parsing manifest")?)
 }
 
 fn save_manifest(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
-    fs::write(&repo.manifest, serde_json::to_string_pretty(manifest)? + "\n")?;
+    repo.ensure_layout()?;
+    fs::write(
+        &repo.manifest,
+        serde_json::to_string_pretty(manifest)? + "\n",
+    )?;
     Ok(())
 }
 
@@ -549,7 +920,11 @@ fn infer_source_type(source: &str) -> &'static str {
 
 fn basename_from_source(source: &str) -> String {
     if source.starts_with("http://") || source.starts_with("https://") {
-        source.rsplit('/').next().unwrap_or("artifact.bin").to_string()
+        source
+            .rsplit('/')
+            .next()
+            .unwrap_or("artifact.bin")
+            .to_string()
     } else {
         Path::new(source)
             .file_name()
@@ -622,6 +997,7 @@ fn sha256_hex(path: &Path) -> Result<String> {
 }
 
 fn rebuild_checksums(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
+    repo.ensure_layout()?;
     let mut lines = Vec::new();
     for artifact in &manifest.artifacts {
         let staged = artifact.staged_path(repo);
@@ -640,7 +1016,11 @@ fn rebuild_checksums(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn github_sync_with_progress<F>(payloads: &PayloadPaths, args: &SyncArgs, mut progress: F) -> Result<usize>
+fn github_sync_with_progress<F>(
+    payloads: &PayloadPaths,
+    args: &SyncArgs,
+    mut progress: F,
+) -> Result<usize>
 where
     F: FnMut(String),
 {
@@ -664,8 +1044,16 @@ where
         .artifacts
         .into_iter()
         .filter(|a| a.active)
-        .filter(|artifact| args.platform.as_ref().is_none_or(|platform| &artifact.platform == platform))
-        .filter(|artifact| args.category.as_ref().is_none_or(|category| &artifact.category == category))
+        .filter(|artifact| {
+            args.platform
+                .as_ref()
+                .is_none_or(|platform| &artifact.platform == platform)
+        })
+        .filter(|artifact| {
+            args.category
+                .as_ref()
+                .is_none_or(|category| &artifact.category == category)
+        })
         .filter(|artifact| {
             args.only_filename
                 .as_ref()
@@ -682,9 +1070,13 @@ where
             );
         }
         if let Some(platform) = &args.platform {
-            progress(format!("no active artifacts matched platform filter: {platform}"));
+            progress(format!(
+                "no active artifacts matched platform filter: {platform}"
+            ));
         } else if let Some(category) = &args.category {
-            progress(format!("no active artifacts matched category filter: {category}"));
+            progress(format!(
+                "no active artifacts matched category filter: {category}"
+            ));
         } else {
             progress("no active artifacts matched the current sync filters".into());
         }
@@ -793,7 +1185,11 @@ fn copy_or_download(source: &str) -> Result<(PathBuf, String, String)> {
         let filename = basename_from_source(source);
         let path = tmpdir.join(filename);
         fs::write(&path, response.bytes()?)?;
-        Ok((path, source.to_string(), infer_source_type(source).to_string()))
+        Ok((
+            path,
+            source.to_string(),
+            infer_source_type(source).to_string(),
+        ))
     } else {
         let path = PathBuf::from(source);
         if !path.is_file() {
@@ -808,7 +1204,7 @@ fn copy_or_download(source: &str) -> Result<(PathBuf, String, String)> {
 }
 
 fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
-    fs::create_dir_all(&repo.release_dir)?;
+    repo.init_if_missing()?;
     let (source_path, source_identity, inferred_source_type) = copy_or_download(&args.source)?;
     let filename = args
         .filename
@@ -894,7 +1290,11 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_artifact_views(repo: &RepoPaths, manifest: Manifest, payloads: &PayloadPaths) -> Vec<ArtifactView> {
+fn build_artifact_views(
+    repo: &RepoPaths,
+    manifest: Manifest,
+    payloads: &PayloadPaths,
+) -> Vec<ArtifactView> {
     let metadata = load_local_metadata(payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     manifest
         .artifacts
@@ -929,10 +1329,8 @@ fn build_artifact_views(repo: &RepoPaths, manifest: Manifest, payloads: &Payload
         .collect()
 }
 
-fn list_command(repo: &RepoPaths, args: &ListArgs) -> Result<()> {
-    let manifest = load_manifest(repo)?;
-    let payloads = PayloadPaths::discover()?;
-    let mut views = build_artifact_views(repo, manifest, &payloads);
+fn filter_artifact_views<'a>(views: Vec<ArtifactView>, args: &'a ListArgs) -> Vec<ArtifactView> {
+    let mut views = views;
     views.retain(|artifact| {
         args.platform
             .as_ref()
@@ -944,6 +1342,13 @@ fn list_command(repo: &RepoPaths, args: &ListArgs) -> Result<()> {
             && args.active.is_none_or(|active| artifact.active == active)
             && args.synced.is_none_or(|synced| artifact.synced == synced)
     });
+    views
+}
+
+fn list_command(repo: &RepoPaths, args: &ListArgs) -> Result<()> {
+    let manifest = load_manifest(repo)?;
+    let payloads = PayloadPaths::discover()?;
+    let views = filter_artifact_views(build_artifact_views(repo, manifest, &payloads), args);
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&views)?);
@@ -988,10 +1393,11 @@ fn show_command(repo: &RepoPaths, args: &ShowArgs) -> Result<()> {
     let payloads = PayloadPaths::discover()?;
     let metadata = load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     let staged_path = artifact.staged_path(repo);
-    let local = metadata
-        .artifacts
-        .into_iter()
-        .find(|m| m.filename == args.filename && m.platform == artifact.platform && m.category == artifact.category);
+    let local = metadata.artifacts.into_iter().find(|m| {
+        m.filename == args.filename
+            && m.platform == artifact.platform
+            && m.category == artifact.category
+    });
 
     if args.json {
         println!(
@@ -1020,6 +1426,39 @@ fn show_command(repo: &RepoPaths, args: &ShowArgs) -> Result<()> {
 fn resolve_url_command(filename: &str) -> Result<()> {
     let url = backend_sync().resolve_url(filename, None)?;
     println!("{url}");
+    Ok(())
+}
+
+fn init_command(repo: &RepoPaths) -> Result<()> {
+    let manifest_exists = repo.manifest.exists();
+    let checksums_exists = repo.checksums.exists();
+    let release_dir_exists = repo.release_dir.exists();
+    repo.init_if_missing()?;
+    println!("[+] Catalog root: {}", repo.root.display());
+    println!(
+        "[+] manifests/: {}",
+        if manifest_exists {
+            "kept existing artifacts.yaml"
+        } else {
+            "created artifacts.yaml"
+        }
+    );
+    println!(
+        "[+] checksums/: {}",
+        if checksums_exists {
+            "kept existing sha256sums.txt"
+        } else {
+            "created sha256sums.txt"
+        }
+    );
+    println!(
+        "[+] staging/release-assets/: {}",
+        if release_dir_exists {
+            "kept existing directory"
+        } else {
+            "created directory"
+        }
+    );
     Ok(())
 }
 
@@ -1086,7 +1525,7 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
     let mut notes = Vec::new();
 
     if !repo.root.join(".git").exists() {
-        problems.push("not a git repo".to_string());
+        notes.push("catalog root is not a git checkout".to_string());
     } else {
         if git_output(&repo.root, &["rev-parse", "--abbrev-ref", "HEAD"]).is_err() {
             problems.push("git repo present but current branch could not be resolved".to_string());
@@ -1106,7 +1545,8 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
     }
     let payloads = PayloadPaths::discover()?;
     let manifest = load_manifest(repo)?;
-    let payload_metadata = load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
+    let payload_metadata =
+        load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     notes.push(format!("payload root: {}", payloads.root.display()));
 
     let staged_names: std::collections::BTreeSet<String> = fs::read_dir(&repo.release_dir)
@@ -1115,7 +1555,11 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
         .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
         .map(|entry| entry.path())
         .filter(|path| path.is_file())
-        .filter_map(|path| path.file_name().and_then(|s| s.to_str()).map(str::to_string))
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
         .filter(|name| !name.starts_with('.'))
         .collect();
     let manifest_names: std::collections::BTreeSet<String> = manifest
@@ -1124,7 +1568,9 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
         .map(|artifact| artifact.release_asset_name.clone())
         .collect();
     for missing in manifest_names.difference(&staged_names) {
-        problems.push(format!("manifest references missing staged asset: {missing}"));
+        problems.push(format!(
+            "manifest references missing staged asset: {missing}"
+        ));
     }
     for orphan in staged_names.difference(&manifest_names) {
         problems.push(format!("staged asset not tracked in manifest: {orphan}"));
@@ -1158,7 +1604,10 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
                     notes.push("manifest URL reachable".to_string());
                 }
                 Ok(resp) => {
-                    problems.push(format!("manifest URL returned HTTP {}", resp.status().as_u16()));
+                    problems.push(format!(
+                        "manifest URL returned HTTP {}",
+                        resp.status().as_u16()
+                    ));
                 }
                 Err(err) => {
                     problems.push(format!("manifest URL unreachable: {err}"));
@@ -1166,7 +1615,38 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
             }
         }
         BackendKind::OciRegistry => {
-            notes.push("LOCKER_BACKEND=oci-registry set; backend not implemented yet".to_string());
+            notes.push("LOCKER_BACKEND=oci-registry".to_string());
+            match oci_repository() {
+                Ok(repository) => {
+                    notes.push(format!("oci repository: {repository}"));
+                    notes.push(format!(
+                        "oci manifest ref: {}",
+                        oci_resolved_url(&oci_manifest_tag())?
+                    ));
+                    notes.push(format!(
+                        "oci checksums ref: {}",
+                        oci_resolved_url(&oci_checksums_tag())?
+                    ));
+                }
+                Err(err) => problems.push(err.to_string()),
+            }
+            match ensure_oras_available() {
+                Ok(()) => notes.push("oras available".to_string()),
+                Err(err) => problems.push(err.to_string()),
+            }
+            if problems.is_empty() {
+                match load_remote_oci_manifest() {
+                    Ok(remote_manifest) => {
+                        notes.push(format!(
+                            "remote OCI manifest reachable ({} artifact(s))",
+                            remote_manifest.artifacts.len()
+                        ));
+                    }
+                    Err(err) => {
+                        problems.push(format!("remote OCI manifest unreachable: {err}"));
+                    }
+                }
+            }
         }
     }
     if let Err(err) = verify_command(repo) {
@@ -1194,7 +1674,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
         return Ok(());
     }
     let payloads = PayloadPaths::discover()?;
-    let mut metadata = load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
+    let mut metadata =
+        load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     let hints = "j/k move  / search  esc clear  s sync  S bulk-sync  v verify  Enter actions  R reload  a toggle  y/p/u/r copy  q quit";
     let mut status = String::from("ready");
     let mut progress_line = String::from("task: idle");
@@ -1399,7 +1880,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                     continue;
                 }
                 let visible_indices = filtered_artifact_indices(&manifest, &filter_query);
-                let selected_visible = selected_visible_index(state.selected(), visible_indices.len());
+                let selected_visible =
+                    selected_visible_index(state.selected(), visible_indices.len());
                 match key.code {
                     KeyCode::Char('q') => break Ok(()),
                     KeyCode::Esc => {
@@ -1409,7 +1891,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                     }
                     KeyCode::Char('/') => {
                         search_input = Some(filter_query.clone());
-                        status = "search mode: type to filter, Enter to apply, Esc to cancel".into();
+                        status =
+                            "search mode: type to filter, Enter to apply, Esc to cancel".into();
                     }
                     KeyCode::Char('R') => {
                         if task.is_some() {
@@ -1417,7 +1900,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                             continue;
                         }
                         manifest = load_manifest(repo)?;
-                        metadata = load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
+                        metadata = load_local_metadata(&payloads)
+                            .unwrap_or(LocalMetadata { artifacts: vec![] });
                         state.select(Some(0));
                         status = "reloaded manifest and local metadata".into();
                     }
@@ -1457,7 +1941,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                 artifacts,
                                 format!("synced {count} filtered artifact(s)"),
                             ));
-                            progress_line = format!("task: queued bulk sync for {count} artifact(s)");
+                            progress_line =
+                                format!("task: queued bulk sync for {count} artifact(s)");
                             status = "bulk sync started".into();
                         }
                     }
@@ -1499,7 +1984,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                         vec![artifact.clone()],
                                         format!("synced {}", artifact.filename),
                                     ));
-                                    progress_line = format!("task: queued sync for {}", artifact.filename);
+                                    progress_line =
+                                        format!("task: queued sync for {}", artifact.filename);
                                     status = "sync started".into();
                                 }
                             }
@@ -1517,7 +2003,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                         artifacts,
                                         format!("synced {count} filtered artifact(s)"),
                                     ));
-                                    progress_line = format!("task: queued bulk sync for {count} artifact(s)");
+                                    progress_line =
+                                        format!("task: queued bulk sync for {count} artifact(s)");
                                     status = "bulk sync started".into();
                                 }
                             }
@@ -1527,7 +2014,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                 status = "verify started".into();
                             }
                             Some(3) => {
-                                if let Some(actual_idx) = visible_indices.get(selected_visible).copied()
+                                if let Some(actual_idx) =
+                                    visible_indices.get(selected_visible).copied()
                                     && let Some(artifact) = manifest.artifacts.get_mut(actual_idx)
                                 {
                                     artifact.active = !artifact.active;
@@ -1547,7 +2035,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                             Some(5) => {
                                 if let Some(actual_idx) = visible_indices.get(selected_visible) {
                                     let artifact = &manifest.artifacts[*actual_idx];
-                                    let artifact_state = tui_artifact_state(repo, &payloads, &metadata, artifact);
+                                    let artifact_state =
+                                        tui_artifact_state(repo, &payloads, &metadata, artifact);
                                     let value = artifact_state
                                         .local_path
                                         .or(artifact_state.expected_local_path)
@@ -1626,7 +2115,8 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                     KeyCode::Char('p') => {
                         if let Some(actual_idx) = visible_indices.get(selected_visible) {
                             let artifact = &manifest.artifacts[*actual_idx];
-                            let artifact_state = tui_artifact_state(repo, &payloads, &metadata, artifact);
+                            let artifact_state =
+                                tui_artifact_state(repo, &payloads, &metadata, artifact);
                             let value = artifact_state
                                 .local_path
                                 .or(artifact_state.expected_local_path)
@@ -1669,6 +2159,30 @@ fn home_dir() -> PathBuf {
     env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn xdg_data_home() -> PathBuf {
+    env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".local/share"))
+}
+
+fn default_catalog_root() -> PathBuf {
+    xdg_data_home().join("artifact-catalog")
+}
+
+fn repo_checkout_root() -> Result<Option<PathBuf>> {
+    let cwd = env::current_dir().context("could not determine current directory")?;
+    if cwd.join("manifests/artifacts.yaml").exists() {
+        return Ok(Some(cwd));
+    }
+
+    let root = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .filter(|p| p.join("manifests/artifacts.yaml").exists());
+    Ok(root)
 }
 
 fn should_be_executable(filename: &str) -> bool {
@@ -1715,18 +2229,18 @@ fn save_local_metadata(payloads: &PayloadPaths, metadata: &LocalMetadata) -> Res
 }
 
 fn upsert_local_metadata(metadata: &mut LocalMetadata, record: LocalArtifactRecord) {
-    if let Some(existing) = metadata
-        .artifacts
-        .iter_mut()
-        .find(|m| m.filename == record.filename && m.platform == record.platform && m.category == record.category)
-    {
+    if let Some(existing) = metadata.artifacts.iter_mut().find(|m| {
+        m.filename == record.filename
+            && m.platform == record.platform
+            && m.category == record.category
+    }) {
         *existing = record;
     } else {
         metadata.artifacts.push(record);
     }
-    metadata
-        .artifacts
-        .sort_by(|a, b| (&a.platform, &a.category, &a.filename).cmp(&(&b.platform, &b.category, &b.filename)));
+    metadata.artifacts.sort_by(|a, b| {
+        (&a.platform, &a.category, &a.filename).cmp(&(&b.platform, &b.category, &b.filename))
+    });
 }
 
 fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
@@ -1784,8 +2298,7 @@ fn tui_artifact_state(
                 .as_ref()
                 .is_none_or(|expected| &record.local_path == expected)
     });
-    let stale = !synced
-        && (record.is_some() || dest.as_ref().is_some_and(|path| path.is_file()));
+    let stale = !synced && (record.is_some() || dest.as_ref().is_some_and(|path| path.is_file()));
 
     TuiArtifactState {
         staged,
@@ -1818,7 +2331,11 @@ fn selected_visible_index(current: Option<usize>, visible_len: usize) -> usize {
     }
 }
 
-fn spawn_sync_task(payloads: PayloadPaths, artifacts: Vec<Artifact>, success_message: String) -> TuiTask {
+fn spawn_sync_task(
+    payloads: PayloadPaths,
+    artifacts: Vec<Artifact>,
+    success_message: String,
+) -> TuiTask {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let total = artifacts.len();
@@ -1847,7 +2364,7 @@ fn spawn_sync_task(payloads: PayloadPaths, artifacts: Vec<Artifact>, success_mes
                     })
                     .map(|_| ())
                 }
-                BackendKind::OciRegistry => Err(anyhow!("OCI sync backend is not implemented yet.")),
+                BackendKind::OciRegistry => OciRegistryBackend.sync(&payloads, &args),
             };
 
             if let Err(err) = result {
@@ -1958,4 +2475,92 @@ fn tui_prompt_select(
     terminal.hide_cursor()?;
 
     Ok(result?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn init_if_missing_creates_catalog_layout() {
+        let temp = TestDir::new("artifact-catalog-init");
+        let repo = RepoPaths::from_root(temp.path.clone());
+
+        repo.init_if_missing().expect("initialize repo");
+
+        assert!(repo.manifest.exists());
+        assert!(repo.checksums.exists());
+        assert!(repo.release_dir.exists());
+
+        let manifest = load_manifest(&repo).expect("load initialized manifest");
+        assert!(manifest.artifacts.is_empty());
+        assert_eq!(
+            fs::read_to_string(&repo.checksums).expect("read checksums"),
+            ""
+        );
+    }
+
+    #[test]
+    fn ensure_initialized_errors_for_missing_layout() {
+        let temp = TestDir::new("artifact-catalog-missing");
+        let repo = RepoPaths::from_root(temp.path.clone());
+
+        let err = repo.ensure_initialized().expect_err("missing layout should fail");
+        assert!(err
+            .to_string()
+            .contains("locker catalog is not initialized"));
+    }
+
+    #[test]
+    fn discover_uses_explicit_root_override() {
+        let temp = TestDir::new("artifact-catalog-root");
+        let chosen = temp.path.join("chosen-root");
+        fs::create_dir_all(&chosen).expect("create chosen root");
+
+        let repo = RepoPaths::discover(Some(chosen.as_path())).expect("discover root");
+
+        assert_eq!(repo.root, chosen);
+    }
+
+    #[test]
+    fn default_catalog_root_respects_xdg_data_home() {
+        let temp = TestDir::new("artifact-catalog-xdg");
+        let xdg_home = temp.path.join("xdg-home");
+        fs::create_dir_all(&xdg_home).expect("create xdg home");
+
+        unsafe {
+            env::set_var("XDG_DATA_HOME", &xdg_home);
+        }
+        let result = default_catalog_root();
+        unsafe {
+            env::remove_var("XDG_DATA_HOME");
+        }
+
+        assert_eq!(result, xdg_home.join("artifact-catalog"));
+    }
 }
