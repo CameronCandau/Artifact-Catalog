@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -202,6 +203,10 @@ impl Artifact {
 
     fn provenance_kind(&self) -> &'static str {
         self.provenance.kind.as_str()
+    }
+
+    fn pulled_oci_path(&self, output_dir: &Path) -> PathBuf {
+        output_dir.join(&self.object_name)
     }
 }
 
@@ -573,10 +578,54 @@ fn temp_work_dir(prefix: &str) -> PathBuf {
     env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
-fn load_remote_oci_manifest() -> Result<Manifest> {
+fn parse_checksums(raw: &str) -> Result<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (sha256, object_name) = line
+            .split_once("  ")
+            .ok_or_else(|| anyhow!("invalid checksum line {}: {}", idx + 1, line))?;
+        if sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            bail!("invalid SHA256 in checksum line {}: {}", idx + 1, sha256);
+        }
+        if object_name.trim().is_empty() {
+            bail!("missing object name in checksum line {}", idx + 1);
+        }
+        if parsed
+            .insert(object_name.to_string(), sha256.to_ascii_lowercase())
+            .is_some()
+        {
+            bail!("duplicate checksum entry for {}", object_name);
+        }
+    }
+    Ok(parsed)
+}
+
+fn validate_manifest_checksums(
+    manifest: &Manifest,
+    checksums: &BTreeMap<String, String>,
+) -> Result<()> {
+    let expected: BTreeMap<String, String> = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.object_name.clone(), artifact.sha256.to_ascii_lowercase()))
+        .collect();
+    if expected.len() != manifest.artifacts.len() {
+        bail!("manifest contains duplicate object_name entries");
+    }
+    if expected != *checksums {
+        bail!("checksum file does not match manifest entries");
+    }
+    Ok(())
+}
+
+fn pull_oci_file(tag: &str, expected_filename: &str) -> Result<Vec<u8>> {
     let tmpdir = temp_work_dir("locker-oci-manifest");
     fs::create_dir_all(&tmpdir)?;
-    let reference = oci_reference(&oci_manifest_tag())?;
+    let reference = oci_reference(tag)?;
     let pull_args = vec![
         "pull".to_string(),
         "--output".to_string(),
@@ -585,13 +634,42 @@ fn load_remote_oci_manifest() -> Result<Manifest> {
     ];
     let result = (|| {
         run_oras(&tmpdir, &pull_args)?;
-        let path = tmpdir.join("artifacts.yaml");
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading pulled OCI manifest file from {}", reference))?;
-        serde_json::from_str(&raw).context("parsing pulled OCI manifest")
+        let path = tmpdir.join(expected_filename);
+        fs::read(&path).with_context(|| {
+            format!(
+                "reading pulled OCI file {} from {}",
+                expected_filename, reference
+            )
+        })
     })();
     let _ = fs::remove_dir_all(&tmpdir);
     result
+}
+
+fn load_remote_oci_manifest() -> Result<Manifest> {
+    let raw = String::from_utf8(pull_oci_file(&oci_manifest_tag(), "artifacts.yaml")?)
+        .context("remote OCI manifest is not valid UTF-8")?;
+    serde_json::from_str(&raw).context("parsing pulled OCI manifest")
+}
+
+fn load_remote_oci_checksums() -> Result<BTreeMap<String, String>> {
+    let raw = String::from_utf8(pull_oci_file(&oci_checksums_tag(), "sha256sums.txt")?)
+        .context("remote OCI checksums are not valid UTF-8")?;
+    parse_checksums(&raw)
+}
+
+fn push_unique_tag(tags: &mut Vec<String>, tag: String) {
+    if !tags.iter().any(|existing| existing == &tag) {
+        tags.push(tag);
+    }
+}
+
+fn oci_metadata_tags(args: &PublishArgs) -> (Vec<String>, Vec<String>) {
+    let mut manifest_tags = vec![oci_manifest_tag()];
+    let mut checksum_tags = vec![oci_checksums_tag()];
+    push_unique_tag(&mut manifest_tags, format!("{}-manifest", args.tag));
+    push_unique_tag(&mut checksum_tags, format!("{}-sha256sums", args.tag));
+    (manifest_tags, checksum_tags)
 }
 
 impl PublishBackend for GithubReleasesBackend {
@@ -761,28 +839,32 @@ impl SyncBackend for GithubReleasesBackend {
 }
 
 impl PublishBackend for OciRegistryBackend {
-    fn publish(&self, repo: &RepoPaths, _manifest: &Manifest, _args: &PublishArgs) -> Result<()> {
+    fn publish(&self, repo: &RepoPaths, _manifest: &Manifest, args: &PublishArgs) -> Result<()> {
         let repository = oci_repository()?;
+        let (manifest_tags, checksum_tags) = oci_metadata_tags(args);
         let staged_count = fs::read_dir(&repo.release_dir)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.is_file())
             .count();
-        let total = staged_count + 2;
-        let mut files = vec![
-            (
-                oci_manifest_tag(),
+        let total = staged_count + manifest_tags.len() + checksum_tags.len();
+        let mut files = Vec::new();
+        for tag in manifest_tags {
+            files.push((
+                tag,
                 repo.manifest.clone(),
                 OCI_ARTIFACT_TYPE_MANIFEST,
                 "artifacts.yaml".to_string(),
-            ),
-            (
-                oci_checksums_tag(),
+            ));
+        }
+        for tag in checksum_tags {
+            files.push((
+                tag,
                 repo.checksums.clone(),
                 OCI_ARTIFACT_TYPE_CHECKSUMS,
                 "sha256sums.txt".to_string(),
-            ),
-        ];
+            ));
+        }
         for entry in fs::read_dir(&repo.release_dir)? {
             let path = entry?.path();
             if path.is_file() {
@@ -819,6 +901,8 @@ impl SyncBackend for OciRegistryBackend {
     fn sync(&self, payloads: &PayloadPaths, args: &SyncArgs) -> Result<()> {
         payloads.ensure_dirs()?;
         let manifest = load_remote_oci_manifest()?;
+        let checksums = load_remote_oci_checksums()?;
+        validate_manifest_checksums(&manifest, &checksums)?;
         let total_available = manifest.artifacts.len();
         let mut artifacts: Vec<Artifact> = manifest
             .artifacts
@@ -893,17 +977,20 @@ impl SyncBackend for OciRegistryBackend {
                 let _ = fs::remove_dir_all(&tmpdir);
                 err
             })?;
-            let pulled_path = tmpdir.join(&artifact.filename);
+            let pulled_path = artifact.pulled_oci_path(&tmpdir);
             let digest = sha256_hex(&pulled_path).map_err(|err| {
                 let _ = fs::remove_dir_all(&tmpdir);
                 err
             })?;
-            if digest != artifact.sha256 {
+            let expected_sha = checksums
+                .get(artifact.object_name())
+                .ok_or_else(|| anyhow!("missing checksum entry for {}", artifact.object_name()))?;
+            if digest != *expected_sha {
                 let _ = fs::remove_dir_all(&tmpdir);
                 bail!(
                     "SHA256 mismatch for {}: expected {}, got {}",
                     artifact.filename,
-                    artifact.sha256,
+                    expected_sha,
                     digest
                 );
             }
@@ -1181,11 +1268,14 @@ where
         .send()?
         .error_for_status()?
         .json()?;
-    let _checksums = client
-        .get(github_checksums_url())
-        .send()?
-        .error_for_status()?
-        .text()?;
+    let checksums = parse_checksums(
+        &client
+            .get(github_checksums_url())
+            .send()?
+            .error_for_status()?
+            .text()?,
+    )?;
+    validate_manifest_checksums(&manifest, &checksums)?;
 
     progress(format!("payload root: {}", payloads.root.display()));
     progress(format!("artifact base URL: {}", github_base_url()));
@@ -1259,11 +1349,14 @@ where
             hasher.update(&bytes);
             format!("{:x}", hasher.finalize())
         };
-        if digest != artifact.sha256 {
+        let expected_sha = checksums
+            .get(artifact.object_name())
+            .ok_or_else(|| anyhow!("missing checksum entry for {}", artifact.object_name()))?;
+        if digest != *expected_sha {
             bail!(
                 "SHA256 mismatch for {}: expected {}, got {}",
                 artifact.filename,
-                artifact.sha256,
+                expected_sha,
                 digest
             );
         }
@@ -3106,6 +3199,68 @@ mod tests {
 
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("provenance.commit"));
+    }
+
+    #[test]
+    fn parse_checksums_and_validate_manifest_round_trip() {
+        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let manifest = Manifest {
+            artifacts: vec![artifact.clone()],
+        };
+        let raw = format!("{}  {}\n", artifact.sha256, artifact.object_name);
+
+        let checksums = parse_checksums(&raw).expect("parse checksums");
+        validate_manifest_checksums(&manifest, &checksums).expect("validate manifest checksums");
+    }
+
+    #[test]
+    fn validate_manifest_checksums_rejects_mismatch() {
+        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let manifest = Manifest {
+            artifacts: vec![artifact],
+        };
+        let checksums = parse_checksums(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  linux--bin--pspy64\n",
+        )
+        .expect("parse mismatched checksums");
+
+        let err =
+            validate_manifest_checksums(&manifest, &checksums).expect_err("mismatch should fail");
+        assert!(err.to_string().contains("checksum file does not match manifest"));
+    }
+
+    #[test]
+    fn pulled_oci_path_uses_object_name() {
+        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let output_dir = PathBuf::from("/tmp/pull-output");
+
+        assert_eq!(
+            artifact.pulled_oci_path(&output_dir),
+            output_dir.join("linux--bin--pspy64")
+        );
+    }
+
+    #[test]
+    fn oci_metadata_tags_include_stable_and_versioned_refs() {
+        let args = PublishArgs {
+            tag: "v2026-04-28".into(),
+            title: None,
+            notes_file: None,
+        };
+
+        let (manifest_tags, checksum_tags) = oci_metadata_tags(&args);
+
+        assert_eq!(
+            manifest_tags,
+            vec!["artifacts-manifest".to_string(), "v2026-04-28-manifest".to_string()]
+        );
+        assert_eq!(
+            checksum_tags,
+            vec![
+                "artifacts-sha256sums".to_string(),
+                "v2026-04-28-sha256sums".to_string()
+            ]
+        );
     }
 
     #[test]

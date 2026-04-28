@@ -64,9 +64,12 @@ locker publish vYYYY-MM-DD
 
 What gets published:
 
-- `artifacts.yaml` as the OCI tag `artifacts-manifest`
-- `sha256sums.txt` as the OCI tag `artifacts-sha256sums`
+- `artifacts.yaml` as the stable OCI tag `artifacts-manifest` and the versioned tag `<publish-tag>-manifest`
+- `sha256sums.txt` as the stable OCI tag `artifacts-sha256sums` and the versioned tag `<publish-tag>-sha256sums`
 - each staged artifact under tag `object_name`
+
+Sync validates remote checksum data against the published manifest before it
+writes payloads locally.
 
 Fallback backend: GitHub Releases.
 

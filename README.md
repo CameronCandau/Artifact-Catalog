@@ -392,8 +392,8 @@ OCI backend notes:
 - `oras` must be installed and on `PATH`
 - authenticate separately if your registry requires it, for example `oras login ...`
 - each staged artifact is published to the configured OCI repository with tag `object_name`
-- `artifacts.yaml` is published under tag `artifacts-manifest`
-- `sha256sums.txt` is published under tag `artifacts-sha256sums`
+- `artifacts.yaml` is published under the stable tag `artifacts-manifest` and a versioned tag derived from `publish <tag>`
+- `sha256sums.txt` is published under the stable tag `artifacts-sha256sums` and a versioned tag derived from `publish <tag>`
 - `resolve-url` returns `oci://...` references when `LOCKER_BACKEND=oci-registry`
 - set `ARTIFACT_CATALOG_OCI_PLAIN_HTTP=true` only for insecure local registries
 
@@ -435,11 +435,12 @@ Synced files land under `~/tools/payloads/` by default, with metadata written to
 
 What sync verifies:
 
-- GitHub backend downloads `artifacts.yaml`, downloads each selected asset, and
-  checks the asset SHA256 against the manifest entry before writing it locally
+- GitHub backend downloads `artifacts.yaml` plus `sha256sums.txt`, verifies
+  that the checksum file matches the manifest, then checks each selected asset
+  SHA256 before writing it locally
 - OCI backend pulls `artifacts.yaml` with `oras`, pulls each selected artifact
-  by `object_name`, and checks the pulled file SHA256 against the
-  manifest entry before writing it locally
+  by `object_name`, verifies the pulled checksum object against the manifest,
+  and checks each pulled file SHA256 before writing it locally
 
 What local sync metadata means:
 
