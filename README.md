@@ -4,6 +4,14 @@
 red-team artifacts. It tracks artifact metadata, checksums, staged release
 assets, and local sync state.
 
+The software ships with an empty default catalog. Real catalog contents are
+user data and should live under the selected catalog root. This repo includes
+example files under `examples/` for reference.
+
+This repo is the software package. If you want to publish and maintain a real
+artifact mirror, use a separate catalog-content repo that stores your manifest,
+checksums, and publishing automation.
+
 This repo tracks:
 
 - artifact metadata
@@ -16,6 +24,7 @@ This repo tracks:
 
 ```text
 Artifact-Catalog/
+├── examples/
 ├── src/
 ├── Cargo.toml
 ├── builds/
@@ -29,6 +38,30 @@ Artifact-Catalog/
 ## Source Of Truth
 
 `manifests/artifacts.yaml` is the catalog source of truth. It uses JSON-compatible YAML so it can be edited and validated without extra dependencies.
+
+The checked-in default `manifests/artifacts.yaml` is intentionally empty. Use
+`locker init` to create your own catalog root, then add artifacts there. If you
+want a starting point, copy one of the example files from `examples/`.
+
+If you want a stable personal location without passing `--root` every time, set
+it in `~/.config/artifact-catalog/config.yaml`:
+
+```text
+{
+  "catalog_root": "/path/to/your/catalog",
+  "payloads_dir": "/path/to/payloads",
+  "default_backend": "github-releases",
+  "github_owner": "your-github-user",
+  "github_repo": "your-catalog-repo",
+  "oci_repository": "public.ecr.aws/alias/artifact-catalog"
+}
+```
+
+Use config for non-secret defaults only. Keep credentials out of this file:
+
+- GitHub publishing auth: `GITHUB_TOKEN`
+- OCI auth: `oras login` or your registry credential helper
+- crates.io auth: `cargo login` or `CARGO_REGISTRY_TOKEN`
 
 Use `artifact-catalog` when you want to:
 
@@ -44,12 +77,27 @@ For installed use, `locker` supports a default catalog root under
 `$XDG_DATA_HOME/artifact-catalog` (falling back to
 `~/.local/share/artifact-catalog`).
 
+The config file can also provide defaults for:
+
+- `payloads_dir`
+- `default_backend`
+- `github_owner`
+- `github_repo`
+- `github_base_url`
+- `github_manifest_url`
+- `github_checksums_url`
+- `oci_repository`
+- `oci_manifest_tag`
+- `oci_checksums_tag`
+- `oci_plain_http`
+
 Catalog root precedence is:
 
 1. `--root <PATH>`
 2. `LOCKER_ROOT`
-3. a detected repo checkout
-4. the XDG default root
+3. `~/.config/artifact-catalog/config.yaml` `catalog_root`
+4. a detected repo checkout
+5. the XDG default root
 
 Each artifact entry contains:
 
@@ -197,6 +245,17 @@ default XDG location:
 locker --root /path/to/catalog init
 ```
 
+Optional example bootstrap:
+
+```bash
+cp examples/artifacts.example.yaml /path/to/catalog/manifests/artifacts.yaml
+cp examples/sha256sums.example.txt /path/to/catalog/checksums/sha256sums.txt
+```
+
+If you maintain a real shared catalog, keep that manifest and its publishing
+workflow in a separate repo. Treat this repo’s `examples/` directory as sample
+content only.
+
 ### CLI commands
 
 ```bash
@@ -205,8 +264,8 @@ scripts/locker add /path/to/file
 scripts/locker list
 scripts/locker list --platform windows --synced false
 scripts/locker list --json
-scripts/locker show SweetPotato.exe
-scripts/locker show SweetPotato.exe --json
+scripts/locker show pspy64
+scripts/locker show pspy64 --json
 scripts/locker verify
 scripts/locker doctor
 scripts/locker publish v2026-04-23
@@ -272,8 +331,8 @@ This is the same happy path as a generic URL add.
 scripts/locker list --platform windows
 scripts/locker list --active true --synced false
 scripts/locker list --json
-scripts/locker show SweetPotato.exe
-scripts/locker show SweetPotato.exe --json
+scripts/locker show pspy64
+scripts/locker show pspy64 --json
 ```
 
 `list` now includes staged and synced state so you can see whether an artifact is only in the catalog, already staged, or already present in your local payload shelf.
@@ -333,7 +392,7 @@ If publishing fails with HTTP `422`, the script now prints the GitHub API respon
 scripts/locker sync
 scripts/locker sync --platform windows
 scripts/locker sync --category bin
-scripts/locker sync --only SweetPotato.exe
+scripts/locker sync --only pspy64
 scripts/locker sync --dry-run
 ```
 
@@ -365,6 +424,8 @@ ARTIFACT_CATALOG_OCI_PLAIN_HTTP=false
 ## Notes
 
 - `locker init` scaffolds `manifests/`, `checksums/`, and `staging/release-assets/` under the selected catalog root
+- the checked-in default manifest is empty; treat `examples/` as reference content, not the product default
+- crate release automation belongs in this repo; catalog-content publish automation should live with the actual catalog data
 - Release assets are published with deterministic names: `platform--category--filename`
 - `artifacts.yaml` and `sha256sums.txt` are published alongside staged assets on both backends
 - `locker tui` can now search, reload, sync, verify, open an action menu, copy values to the clipboard, and show progress in the footer:

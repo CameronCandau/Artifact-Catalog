@@ -17,19 +17,33 @@ locker init
 
 ## Publish To crates.io
 
-Before publishing, do one last review of:
-
-- crate metadata in `Cargo.toml`
-- the public-facing `README.md`
-- any checked-in catalog examples you do or do not want associated with your public profile
-
 ```bash
 cargo publish
+```
+
+GitHub Actions:
+
+- pushes of tags matching `v<semver>` trigger `.github/workflows/publish-crate.yml`
+- the pushed tag must match the package version in `Cargo.toml`
+- `workflow_dispatch` runs the same preflight checks but does not publish
+- the workflow expects `CARGO_REGISTRY_TOKEN` in repository secrets
+
+Example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Publish Catalog Contents
 
 This is separate from publishing the Rust crate itself.
+
+Recommended model:
+
+- keep the `artifact-catalog` crate release workflow in this repo
+- keep your real manifest/checksums and catalog publish automation in a separate catalog-content repo
+- use this repo’s `examples/` and `scripts/bootstrap_release_assets.py` as reference material for that second repo
 
 GitHub Releases backend:
 
@@ -44,6 +58,13 @@ LOCKER_BACKEND=oci-registry
 ARTIFACT_CATALOG_OCI_REPOSITORY=public.ecr.aws/alias/artifact-catalog
 locker publish vYYYY-MM-DD
 ```
+
+Auth model:
+
+- keep non-secret defaults such as backend, repo name, payload directory, and OCI repository in `~/.config/artifact-catalog/config.yaml`
+- keep secrets out of config files
+- provide GitHub auth through `GITHUB_TOKEN`
+- provide OCI auth through `oras login` or your registry’s external credential flow
 
 ## Post-release Checks
 

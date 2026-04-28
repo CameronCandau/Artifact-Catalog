@@ -1,6 +1,6 @@
 [package]
 name = "artifact-catalog"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Curated artifact catalog CLI for staging, verifying, publishing, and syncing operator tooling"
 readme = "README.md"
@@ -18,7 +18,10 @@ include = [
     "src/**",
     "builds/README.md",
     "checksums/sha256sums.txt",
+    "examples/artifacts.example.yaml",
+    "examples/sha256sums.example.txt",
     "manifests/artifacts.yaml",
+    "scripts/bootstrap_release_assets.py",
     "scripts/locker",
     "staging/release-assets/.gitkeep",
 ]

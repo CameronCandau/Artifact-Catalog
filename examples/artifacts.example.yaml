@@ -1,0 +1,59 @@
+{
+  "artifacts": [
+    {
+      "platform": "linux",
+      "category": "bin",
+      "filename": "linpeas_linux_amd64",
+      "version": "20260422-9567fd62",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/peass-ng/PEASS-ng/releases/download/20260422-9567fd62/linpeas_linux_amd64",
+      "sha256": "6d48618b0221ac8012b40cc788c933f69855e90f417a8d383d82efd78819dbd3",
+      "release_asset_name": "linux--bin--linpeas_linux_amd64",
+      "active": true
+    },
+    {
+      "platform": "linux",
+      "category": "bin",
+      "filename": "pspy64",
+      "version": "v1.2.1",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/DominicBreuker/pspy/releases/download/v1.2.1/pspy64",
+      "sha256": "c93f29a5cc1347bdb90e14a12424e6469c8cfea9a20b800bc249755f0043a3bb",
+      "release_asset_name": "linux--bin--pspy64",
+      "active": true
+    },
+    {
+      "platform": "windows",
+      "category": "bin",
+      "filename": "GodPotato-net4.exe",
+      "version": "v1.20",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/BeichenDream/GodPotato/releases/download/V1.20/GodPotato-NET4.exe",
+      "sha256": "9a8e9d587b570d4074f1c8317b163aa8d0c566efd88f294d9d85bc7776352a28",
+      "release_asset_name": "windows--bin--GodPotato-net4.exe",
+      "active": true
+    },
+    {
+      "platform": "windows",
+      "category": "bin",
+      "filename": "ligolo-ng_agent_0.8.3_windows_amd64.exe",
+      "version": "v0.8.3",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/nicocha30/ligolo-ng/releases/download/v0.8.3/ligolo-ng_agent_0.8.3_windows_amd64.zip",
+      "sha256": "4b41f36f82db6da8767a0a1c2997c8242d80b2d10a8f1d28c252a9306ec152b5",
+      "release_asset_name": "windows--bin--ligolo-ng_agent_0.8.3_windows_amd64.exe",
+      "active": true
+    },
+    {
+      "platform": "windows",
+      "category": "bin",
+      "filename": "winPEASx64.exe",
+      "version": "20260422-9567fd62",
+      "source_type": "github-release",
+      "source_ref": "https://github.com/peass-ng/PEASS-ng/releases/download/20260422-9567fd62/winPEASx64.exe",
+      "sha256": "ce709770ac09b79ed9894542a140e76a897bf897bd27855e11cc0ece7194114f",
+      "release_asset_name": "windows--bin--winPEASx64.exe",
+      "active": true
+    }
+  ]
+}
