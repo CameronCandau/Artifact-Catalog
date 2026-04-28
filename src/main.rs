@@ -62,10 +62,22 @@ struct AddArgs {
     filename: Option<String>,
     #[arg(long)]
     version: Option<String>,
-    #[arg(long = "source-type")]
-    source_type: Option<String>,
-    #[arg(long = "source-ref")]
-    source_ref: Option<String>,
+    #[arg(long = "provenance-kind")]
+    provenance_kind: Option<String>,
+    #[arg(long = "source-url")]
+    source_url: Option<String>,
+    #[arg(long = "source-repo")]
+    source_repo: Option<String>,
+    #[arg(long = "source-tag")]
+    source_tag: Option<String>,
+    #[arg(long = "source-commit")]
+    source_commit: Option<String>,
+    #[arg(long = "archive-path")]
+    archive_path: Option<String>,
+    #[arg(long = "build-method")]
+    build_method: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
     #[arg(long)]
     inactive: bool,
     #[arg(long, short = 'y')]
@@ -120,12 +132,15 @@ struct ArtifactView {
     platform: String,
     category: String,
     version: String,
-    source_type: String,
+    provenance_kind: String,
     active: bool,
     staged: bool,
-    synced: bool,
+    present: bool,
+    verified: bool,
+    stale: bool,
     staged_path: String,
-    synced_path: Option<String>,
+    expected_local_path: Option<String>,
+    recorded_local_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,21 +149,59 @@ struct Manifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProvenanceKind {
+    Download,
+    Built,
+    Local,
+}
+
+impl ProvenanceKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Built => "built",
+            Self::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Provenance {
+    kind: ProvenanceKind,
+    uri: Option<String>,
+    repo: Option<String>,
+    tag: Option<String>,
+    commit: Option<String>,
+    asset_name: Option<String>,
+    archive_path: Option<String>,
+    build_method: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Artifact {
     platform: String,
     category: String,
     filename: String,
     version: String,
-    source_type: String,
-    source_ref: String,
+    provenance: Provenance,
     sha256: String,
-    release_asset_name: String,
+    object_name: String,
     active: bool,
 }
 
 impl Artifact {
     fn staged_path(&self, repo: &RepoPaths) -> PathBuf {
-        repo.release_dir.join(&self.release_asset_name)
+        repo.release_dir.join(&self.object_name)
+    }
+
+    fn object_name(&self) -> &str {
+        &self.object_name
+    }
+
+    fn provenance_kind(&self) -> &'static str {
+        self.provenance.kind.as_str()
     }
 }
 
@@ -163,10 +216,9 @@ struct LocalArtifactRecord {
     platform: String,
     category: String,
     version: String,
-    source_type: String,
-    source_ref: String,
+    provenance: Provenance,
     sha256: String,
-    release_asset_name: String,
+    object_name: String,
     local_path: String,
     synced_at_epoch: u64,
 }
@@ -333,7 +385,7 @@ impl BackendKind {
         let backend = env::var("LOCKER_BACKEND")
             .ok()
             .or_else(|| load_config().ok().and_then(|config| config.default_backend))
-            .unwrap_or_else(|| "github-releases".into());
+            .unwrap_or_else(|| "oci-registry".into());
         match backend.as_str()
         {
             "oci" | "oci-registry" => Self::OciRegistry,
@@ -703,7 +755,7 @@ impl SyncBackend for GithubReleasesBackend {
         Ok(format!(
             "{}/{}",
             github_base_url().trim_end_matches('/'),
-            artifact.release_asset_name
+            artifact.object_name()
         ))
     }
 }
@@ -818,7 +870,7 @@ impl SyncBackend for OciRegistryBackend {
         for (idx, artifact) in artifacts.into_iter().enumerate() {
             let step = idx + 1;
             let dest_path = payloads.destination_for(&artifact)?;
-            let reference = oci_reference(&artifact.release_asset_name)?;
+            let reference = oci_reference(artifact.object_name())?;
             println!(
                 "[+] syncing {step}/{total}: {} -> {}",
                 artifact.filename,
@@ -867,18 +919,17 @@ impl SyncBackend for OciRegistryBackend {
 
             upsert_local_metadata(
                 &mut metadata,
-                LocalArtifactRecord {
-                    filename: artifact.filename.clone(),
-                    platform: artifact.platform.clone(),
-                    category: artifact.category.clone(),
-                    version: artifact.version.clone(),
-                    source_type: artifact.source_type.clone(),
-                    source_ref: artifact.source_ref.clone(),
-                    sha256: artifact.sha256.clone(),
-                    release_asset_name: artifact.release_asset_name.clone(),
-                    local_path: dest_path.display().to_string(),
-                    synced_at_epoch: now,
-                },
+            LocalArtifactRecord {
+                filename: artifact.filename.clone(),
+                platform: artifact.platform.clone(),
+                category: artifact.category.clone(),
+                version: artifact.version.clone(),
+                provenance: artifact.provenance.clone(),
+                sha256: artifact.sha256.clone(),
+                object_name: artifact.object_name.clone(),
+                local_path: dest_path.display().to_string(),
+                synced_at_epoch: now,
+            },
             );
             println!("[+] synced {step}/{total}: {}", artifact.filename);
         }
@@ -901,7 +952,7 @@ impl SyncBackend for OciRegistryBackend {
                 a.filename == filename && a.active && platform.is_none_or(|p| a.platform == p)
             })
             .ok_or_else(|| anyhow!("artifact not found: {filename}"))?;
-        oci_resolved_url(&artifact.release_asset_name)
+        oci_resolved_url(artifact.object_name())
     }
 }
 
@@ -954,14 +1005,67 @@ fn save_manifest(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn infer_source_type(source: &str) -> &'static str {
-    if source.starts_with("https://github.com/") && source.contains("/releases/download/") {
-        "github-release"
-    } else if source.starts_with("http://") || source.starts_with("https://") {
-        "url"
-    } else {
-        "local"
+fn parse_provenance_kind(value: &str) -> Result<ProvenanceKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "download" | "upstream" | "release" => Ok(ProvenanceKind::Download),
+        "built" => Ok(ProvenanceKind::Built),
+        "local" => Ok(ProvenanceKind::Local),
+        _ => bail!("unsupported provenance kind: {value}"),
     }
+}
+
+fn infer_provenance_kind(source: &str) -> ProvenanceKind {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        ProvenanceKind::Download
+    } else {
+        ProvenanceKind::Local
+    }
+}
+
+fn is_weak_version(version: &str) -> bool {
+    matches!(
+        version.to_ascii_lowercase().as_str(),
+        "manual" | "latest" | "custom"
+    )
+}
+
+fn looks_like_hex_commit(value: &str) -> bool {
+    value.len() >= 7 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn artifact_provenance_warnings(artifact: &Artifact) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if is_weak_version(&artifact.version) {
+        warnings.push(format!(
+            "{} uses weak version metadata: {}",
+            artifact.filename, artifact.version
+        ));
+    }
+
+    if matches!(artifact.provenance.kind, ProvenanceKind::Built)
+        && artifact
+            .provenance
+            .commit
+            .as_deref()
+            .is_none_or(|commit| !looks_like_hex_commit(commit))
+    {
+        warnings.push(format!(
+            "{} is marked built but provenance.commit is not pinned: {}",
+            artifact.filename,
+            artifact.provenance.commit.as_deref().unwrap_or("<missing>")
+        ));
+    }
+
+    warnings
+}
+
+fn infer_github_repo(source: &str) -> Option<String> {
+    let parsed = url::Url::parse(source).ok()?;
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    Some(format!("https://github.com/{owner}/{repo}"))
 }
 
 fn basename_from_source(source: &str) -> String {
@@ -1050,7 +1154,7 @@ fn rebuild_checksums(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
         if staged.is_file() {
             lines.push(format!(
                 "{}  {}",
-                artifact.sha256, artifact.release_asset_name
+                artifact.sha256, artifact.object_name
             ));
         }
     }
@@ -1138,7 +1242,7 @@ where
     for (idx, artifact) in artifacts.into_iter().enumerate() {
         let step = idx + 1;
         let dest_path = payloads.destination_for(&artifact)?;
-        let url = format!("{}/{}", github_base_url(), artifact.release_asset_name);
+        let url = format!("{}/{}", github_base_url(), artifact.object_name());
         progress(format!(
             "syncing {step}/{total}: {} -> {}",
             artifact.filename,
@@ -1179,10 +1283,9 @@ where
                 platform: artifact.platform.clone(),
                 category: artifact.category.clone(),
                 version: artifact.version.clone(),
-                source_type: artifact.source_type.clone(),
-                source_ref: artifact.source_ref.clone(),
+                provenance: artifact.provenance.clone(),
                 sha256: artifact.sha256.clone(),
-                release_asset_name: artifact.release_asset_name.clone(),
+                object_name: artifact.object_name.clone(),
                 local_path: dest_path.display().to_string(),
                 synced_at_epoch: now,
             },
@@ -1222,7 +1325,24 @@ fn prompt_or_default(
         .interact_text()?)
 }
 
-fn copy_or_download(source: &str) -> Result<(PathBuf, String, String)> {
+fn prompt_required(field: &str, suggested: Option<String>, yes: bool) -> Result<String> {
+    if yes {
+        return suggested
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("missing required {field}; pass --{field} explicitly"));
+    }
+    let mut prompt = Input::new().with_prompt(field);
+    if let Some(default) = suggested.filter(|value| !value.trim().is_empty()) {
+        prompt = prompt.default(default);
+    }
+    let value: String = prompt.interact_text()?;
+    if value.trim().is_empty() {
+        bail!("{field} is required");
+    }
+    Ok(value)
+}
+
+fn copy_or_download(source: &str) -> Result<(PathBuf, String)> {
     if source.starts_with("http://") || source.starts_with("https://") {
         let client = Client::builder().build()?;
         let response = client.get(source).send()?.error_for_status()?;
@@ -1231,27 +1351,19 @@ fn copy_or_download(source: &str) -> Result<(PathBuf, String, String)> {
         let filename = basename_from_source(source);
         let path = tmpdir.join(filename);
         fs::write(&path, response.bytes()?)?;
-        Ok((
-            path,
-            source.to_string(),
-            infer_source_type(source).to_string(),
-        ))
+        Ok((path, source.to_string()))
     } else {
         let path = PathBuf::from(source);
         if !path.is_file() {
             bail!("source file not found: {source}");
         }
-        Ok((
-            path.canonicalize().unwrap_or(path),
-            source.to_string(),
-            "local".to_string(),
-        ))
+        Ok((path.canonicalize().unwrap_or(path), source.to_string()))
     }
 }
 
 fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     repo.init_if_missing()?;
-    let (source_path, source_identity, inferred_source_type) = copy_or_download(&args.source)?;
+    let (source_path, source_identity) = copy_or_download(&args.source)?;
     let filename = args
         .filename
         .clone()
@@ -1259,6 +1371,7 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     let inferred_platform = infer_platform_from_filename(&filename).map(str::to_string);
     let inferred_category = Some(infer_category_from_filename(&filename).to_string());
     let inferred_version = infer_version_from_source(&args.source);
+    let inferred_kind = infer_provenance_kind(&args.source);
 
     let platform = match args.platform {
         Some(v) => v,
@@ -1278,18 +1391,80 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     };
     let version = match args.version {
         Some(v) => v,
-        None => prompt_or_default("version", inferred_version, "manual", args.yes)?,
+        None => prompt_required("version", inferred_version, args.yes)?,
     };
-    let source_type = args.source_type.unwrap_or(inferred_source_type);
-    let source_ref = args.source_ref.unwrap_or_else(|| {
-        if source_identity.starts_with("http://") || source_identity.starts_with("https://") {
-            source_identity.clone()
-        } else {
-            source_path.display().to_string()
-        }
-    });
-    let release_asset_name = format!("{platform}--{category}--{filename}");
-    let dest_path = repo.release_dir.join(&release_asset_name);
+    let provenance_kind = match args.provenance_kind.as_deref() {
+        Some(value) => parse_provenance_kind(value)?,
+        None => inferred_kind,
+    };
+    let default_source_url = if source_identity.starts_with("http://")
+        || source_identity.starts_with("https://")
+    {
+        Some(source_identity.clone())
+    } else {
+        None
+    };
+    let provenance = match provenance_kind {
+        ProvenanceKind::Download => Provenance {
+            kind: ProvenanceKind::Download,
+            uri: Some(match args.source_url {
+                Some(url) => url,
+                None => prompt_or_default(
+                    "source_url",
+                    default_source_url,
+                    "https://example.invalid/download",
+                    args.yes,
+                )?,
+            }),
+            repo: args.source_repo.or_else(|| infer_github_repo(&source_identity)),
+            tag: args.source_tag.or_else(|| infer_version_from_source(&source_identity)),
+            commit: args.source_commit,
+            asset_name: Some(filename.clone()),
+            archive_path: args.archive_path,
+            build_method: args.build_method,
+            notes: args.notes,
+        },
+        ProvenanceKind::Built => Provenance {
+            kind: ProvenanceKind::Built,
+            uri: args.source_url.or(default_source_url),
+            repo: Some(match args.source_repo {
+                Some(repo) => repo,
+                None => prompt_or_default(
+                    "source_repo",
+                    None,
+                    "https://github.com/OWNER/REPO",
+                    args.yes,
+                )?,
+            }),
+            tag: args.source_tag,
+            commit: Some(match args.source_commit {
+                Some(commit) => commit,
+                None => prompt_or_default(
+                    "source_commit",
+                    None,
+                    "abcdef1234567",
+                    args.yes,
+                )?,
+            }),
+            asset_name: Some(filename.clone()),
+            archive_path: args.archive_path,
+            build_method: args.build_method,
+            notes: args.notes,
+        },
+        ProvenanceKind::Local => Provenance {
+            kind: ProvenanceKind::Local,
+            uri: Some(source_path.display().to_string()),
+            repo: args.source_repo,
+            tag: args.source_tag,
+            commit: args.source_commit,
+            asset_name: Some(filename.clone()),
+            archive_path: args.archive_path,
+            build_method: args.build_method,
+            notes: args.notes,
+        },
+    };
+    let object_name = format!("{platform}--{category}--{filename}");
+    let dest_path = repo.release_dir.join(&object_name);
     fs::copy(&source_path, &dest_path)?;
     let sha256 = sha256_hex(&dest_path)?;
 
@@ -1298,10 +1473,9 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
         category,
         filename,
         version,
-        source_type,
-        source_ref,
+        provenance,
         sha256,
-        release_asset_name,
+        object_name,
         active: !args.inactive,
     };
 
@@ -1310,7 +1484,7 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     if let Some(existing) = manifest
         .artifacts
         .iter_mut()
-        .find(|a| a.release_asset_name == artifact.release_asset_name)
+        .find(|a| a.object_name == artifact.object_name)
     {
         *existing = artifact.clone();
         updated_existing = true;
@@ -1327,11 +1501,14 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
         "[+] {} {} -> {}",
         if updated_existing { "Updated" } else { "Added" },
         args.source,
-        artifact.release_asset_name
+        artifact.object_name
     );
     println!("[+] Staged at {}", dest_path.display());
     println!("[+] Version: {}", artifact.version);
-    println!("[+] Source ref: {}", artifact.source_ref);
+    println!("[+] Provenance kind: {}", artifact.provenance.kind.as_str());
+    for warning in artifact_provenance_warnings(&artifact) {
+        println!("[!] {warning}");
+    }
     println!("[+] Next: locker verify");
     Ok(())
 }
@@ -1347,29 +1524,22 @@ fn build_artifact_views(
         .into_iter()
         .map(|artifact| {
             let staged_path = artifact.staged_path(repo);
-            let synced_path = metadata
-                .artifacts
-                .iter()
-                .find(|m| {
-                    m.filename == artifact.filename
-                        && m.platform == artifact.platform
-                        && m.category == artifact.category
-                })
-                .map(|m| m.local_path.clone());
-            let synced = synced_path
-                .as_ref()
-                .is_some_and(|path| Path::new(path).is_file());
+            let local_state = local_payload_state(payloads, &metadata, &artifact);
+            let provenance_kind = artifact.provenance_kind().to_string();
             ArtifactView {
                 filename: artifact.filename,
                 platform: artifact.platform,
                 category: artifact.category,
                 version: artifact.version,
-                source_type: artifact.source_type,
+                provenance_kind,
                 active: artifact.active,
                 staged: staged_path.is_file(),
-                synced,
+                present: local_state.present,
+                verified: local_state.verified,
+                stale: local_state.stale,
                 staged_path: staged_path.display().to_string(),
-                synced_path,
+                expected_local_path: local_state.expected_local_path,
+                recorded_local_path: local_state.recorded_local_path,
             }
         })
         .collect()
@@ -1386,7 +1556,7 @@ fn filter_artifact_views<'a>(views: Vec<ArtifactView>, args: &'a ListArgs) -> Ve
                 .as_ref()
                 .is_none_or(|category| &artifact.category == category)
             && args.active.is_none_or(|active| artifact.active == active)
-            && args.synced.is_none_or(|synced| artifact.synced == synced)
+            && args.synced.is_none_or(|synced| artifact.verified == synced)
     });
     views
 }
@@ -1402,20 +1572,31 @@ fn list_command(repo: &RepoPaths, args: &ListArgs) -> Result<()> {
     }
 
     println!(
-        "{:<32} {:<8} {:<10} {:<20} {:<15} {:<6} {:<6} {:<6}",
-        "filename", "platform", "category", "version", "source_type", "active", "staged", "synced"
+        "{:<32} {:<8} {:<10} {:<20} {:<15} {:<6} {:<6} {:<7} {:<8} {:<6}",
+        "filename",
+        "platform",
+        "category",
+        "version",
+        "provenance",
+        "active",
+        "staged",
+        "present",
+        "verified",
+        "stale"
     );
     for artifact in views {
         println!(
-            "{:<32} {:<8} {:<10} {:<20} {:<15} {:<6} {:<6} {:<6}",
+            "{:<32} {:<8} {:<10} {:<20} {:<15} {:<6} {:<6} {:<7} {:<8} {:<6}",
             artifact.filename,
             artifact.platform,
             artifact.category,
             truncate(&artifact.version, 20),
-            artifact.source_type,
+            artifact.provenance_kind,
             if artifact.active { "yes" } else { "no" },
             if artifact.staged { "yes" } else { "no" },
-            if artifact.synced { "yes" } else { "no" }
+            if artifact.present { "yes" } else { "no" },
+            if artifact.verified { "yes" } else { "no" },
+            if artifact.stale { "yes" } else { "no" }
         );
     }
     Ok(())
@@ -1439,11 +1620,8 @@ fn show_command(repo: &RepoPaths, args: &ShowArgs) -> Result<()> {
     let payloads = PayloadPaths::discover()?;
     let metadata = load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     let staged_path = artifact.staged_path(repo);
-    let local = metadata.artifacts.into_iter().find(|m| {
-        m.filename == args.filename
-            && m.platform == artifact.platform
-            && m.category == artifact.category
-    });
+    let local_state = local_payload_state(&payloads, &metadata, &artifact);
+    let local = local_record_for_artifact(&metadata, &artifact).cloned();
 
     if args.json {
         println!(
@@ -1452,6 +1630,7 @@ fn show_command(repo: &RepoPaths, args: &ShowArgs) -> Result<()> {
                 "artifact": artifact,
                 "staged_path": staged_path,
                 "staged": staged_path.is_file(),
+                "local_state": local_state,
                 "local": local,
             }))?
         );
@@ -1461,9 +1640,26 @@ fn show_command(repo: &RepoPaths, args: &ShowArgs) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&artifact)?);
     println!("staged_path: {}", staged_path.display());
     println!("staged: {}", staged_path.is_file());
+    println!("provenance_kind: {}", artifact.provenance.kind.as_str());
+    println!(
+        "local_expected_path: {}",
+        local_state
+            .expected_local_path
+            .clone()
+            .unwrap_or_else(|| "-".into())
+    );
+    println!(
+        "local_recorded_path: {}",
+        local_state
+            .recorded_local_path
+            .clone()
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("local_present: {}", local_state.present);
+    println!("local_verified: {}", local_state.verified);
+    println!("local_stale: {}", local_state.stale);
     if let Some(local) = local {
         println!("synced_path: {}", local.local_path);
-        println!("synced: {}", Path::new(&local.local_path).is_file());
         println!("synced_at_epoch: {}", local.synced_at_epoch);
     }
     Ok(())
@@ -1540,15 +1736,15 @@ where
         ));
         let path = artifact.staged_path(repo);
         if !path.is_file() {
-            bail!("missing staged asset: {}", artifact.release_asset_name);
+            bail!("missing staged asset: {}", artifact.object_name);
         }
         let digest = sha256_hex(&path)?;
         if digest != artifact.sha256 {
-            bail!("sha mismatch for {}", artifact.release_asset_name);
+            bail!("sha mismatch for {}", artifact.object_name);
         }
         expected.push(format!(
             "{}  {}",
-            artifact.sha256, artifact.release_asset_name
+            artifact.sha256, artifact.object_name
         ));
     }
     expected.sort();
@@ -1569,6 +1765,7 @@ where
 fn doctor_command(repo: &RepoPaths) -> Result<()> {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
+    let mut warnings = Vec::new();
 
     if !repo.root.join(".git").exists() {
         notes.push("catalog root is not a git checkout".to_string());
@@ -1611,7 +1808,7 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
     let manifest_names: std::collections::BTreeSet<String> = manifest
         .artifacts
         .iter()
-        .map(|artifact| artifact.release_asset_name.clone())
+        .map(|artifact| artifact.object_name.clone())
         .collect();
     for missing in manifest_names.difference(&staged_names) {
         problems.push(format!(
@@ -1622,16 +1819,21 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
         problems.push(format!("staged asset not tracked in manifest: {orphan}"));
     }
     for artifact in &manifest.artifacts {
-        let dest = payloads.destination_for(artifact)?;
-        let has_local_record = payload_metadata.artifacts.iter().any(|item| {
-            item.filename == artifact.filename
-                && item.platform == artifact.platform
-                && item.category == artifact.category
-        });
-        if dest.exists() && !has_local_record {
+        warnings.extend(artifact_provenance_warnings(artifact));
+        let local_state = local_payload_state(&payloads, &payload_metadata, artifact);
+        if local_state.present && !local_state.has_local_record {
             problems.push(format!(
-                "synced file exists without local metadata: {}",
-                dest.display()
+                "local payload exists without local metadata: {}",
+                local_state
+                    .expected_local_path
+                    .clone()
+                    .unwrap_or_else(|| artifact.filename.clone())
+            ));
+        } else if local_state.stale {
+            problems.push(format!(
+                "local payload state is stale for {} ({})",
+                artifact.filename,
+                local_state.status_label()
             ));
         }
     }
@@ -1707,6 +1909,9 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
             println!("  - {p}");
         }
     }
+    for warning in warnings {
+        println!("  ! {warning}");
+    }
     for note in notes {
         println!("  * {note}");
     }
@@ -1757,13 +1962,19 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                 .enumerate()
                 .filter(|(idx, _)| visible_indices.contains(idx))
                 .map(|(_, a)| {
-                    let state_tags = tui_artifact_state(repo, &payloads, &metadata, a);
+                    let state_tags = local_payload_state(&payloads, &metadata, a);
                     let active = if a.active { "+" } else { "-" };
-                    let staged = if state_tags.staged { "stg" } else { "---" };
+                    let staged = if a.staged_path(repo).is_file() {
+                        "stg"
+                    } else {
+                        "---"
+                    };
                     let sync = if state_tags.stale {
                         "old"
-                    } else if state_tags.synced {
-                        "syn"
+                    } else if state_tags.verified {
+                        "ver"
+                    } else if state_tags.present {
+                        "pre"
                     } else {
                         "---"
                     };
@@ -1792,16 +2003,31 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
 
             let text = if let Some(actual_idx) = visible_indices.get(selected_visible) {
                 let artifact = &manifest.artifacts[*actual_idx];
-                let artifact_state = tui_artifact_state(repo, &payloads, &metadata, artifact);
+                let artifact_state = local_payload_state(&payloads, &metadata, artifact);
                 Text::from(vec![
                     Line::from(format!("filename: {}", artifact.filename)),
                     Line::from(format!("platform: {}", artifact.platform)),
                     Line::from(format!("category: {}", artifact.category)),
                     Line::from(format!("version: {}", artifact.version)),
-                    Line::from(format!("source_type: {}", artifact.source_type)),
-                    Line::from(format!("source_ref: {}", artifact.source_ref)),
+                    Line::from(format!("provenance_kind: {}", artifact.provenance.kind.as_str())),
+                    Line::from(format!(
+                        "provenance_uri: {}",
+                        artifact.provenance.uri.clone().unwrap_or_else(|| "-".into())
+                    )),
+                    Line::from(format!(
+                        "provenance_repo: {}",
+                        artifact.provenance.repo.clone().unwrap_or_else(|| "-".into())
+                    )),
+                    Line::from(format!(
+                        "provenance_commit: {}",
+                        artifact
+                            .provenance
+                            .commit
+                            .clone()
+                            .unwrap_or_else(|| "-".into())
+                    )),
                     Line::from(format!("sha256: {}", artifact.sha256)),
-                    Line::from(format!("release_asset: {}", artifact.release_asset_name)),
+                    Line::from(format!("object_name: {}", artifact.object_name)),
                     Line::from(format!("active: {}", artifact.active)),
                     Line::from(format!("staged: {}", artifact.staged_path(repo).display())),
                     Line::from(format!(
@@ -1812,19 +2038,15 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                             .unwrap_or_else(|| "-".into())
                     )),
                     Line::from(format!(
-                        "synced: {}",
-                        artifact_state.local_path.unwrap_or_else(|| "-".into())
+                        "recorded_local_path: {}",
+                        artifact_state
+                            .recorded_local_path
+                            .clone()
+                            .unwrap_or_else(|| "-".into())
                     )),
-                    Line::from(format!(
-                        "sync_state: {}",
-                        if artifact_state.synced {
-                            "synced"
-                        } else if artifact_state.stale {
-                            "stale"
-                        } else {
-                            "not-synced"
-                        }
-                    )),
+                    Line::from(format!("local_present: {}", artifact_state.present)),
+                    Line::from(format!("local_verified: {}", artifact_state.verified)),
+                    Line::from(format!("sync_state: {}", artifact_state.status_label())),
                     Line::from(format!("stale: {}", artifact_state.stale)),
                 ])
             } else {
@@ -2016,7 +2238,7 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                 "toggle active",
                                 "copy filename",
                                 "copy path",
-                                "copy source ref",
+                                "copy provenance",
                                 "copy resolved URL",
                                 "cancel",
                             ],
@@ -2082,9 +2304,9 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                                 if let Some(actual_idx) = visible_indices.get(selected_visible) {
                                     let artifact = &manifest.artifacts[*actual_idx];
                                     let artifact_state =
-                                        tui_artifact_state(repo, &payloads, &metadata, artifact);
+                                        local_payload_state(&payloads, &metadata, artifact);
                                     let value = artifact_state
-                                        .local_path
+                                        .recorded_local_path
                                         .or(artifact_state.expected_local_path)
                                         .unwrap_or_else(|| "-".into());
                                     status = copy_status("path", &value);
@@ -2093,7 +2315,13 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                             Some(6) => {
                                 if let Some(actual_idx) = visible_indices.get(selected_visible) {
                                     let artifact = &manifest.artifacts[*actual_idx];
-                                    status = copy_status("source_ref", &artifact.source_ref);
+                                    let value = artifact
+                                        .provenance
+                                        .uri
+                                        .clone()
+                                        .or_else(|| artifact.provenance.repo.clone())
+                                        .unwrap_or_else(|| "-".into());
+                                    status = copy_status("provenance", &value);
                                 }
                             }
                             Some(7) => {
@@ -2162,9 +2390,9 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                         if let Some(actual_idx) = visible_indices.get(selected_visible) {
                             let artifact = &manifest.artifacts[*actual_idx];
                             let artifact_state =
-                                tui_artifact_state(repo, &payloads, &metadata, artifact);
+                                local_payload_state(&payloads, &metadata, artifact);
                             let value = artifact_state
-                                .local_path
+                                .recorded_local_path
                                 .or(artifact_state.expected_local_path)
                                 .unwrap_or_else(|| "-".into());
                             status = copy_status("path", &value);
@@ -2173,7 +2401,13 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                     KeyCode::Char('u') => {
                         if let Some(actual_idx) = visible_indices.get(selected_visible) {
                             let artifact = &manifest.artifacts[*actual_idx];
-                            status = copy_status("source_ref", &artifact.source_ref);
+                            let value = artifact
+                                .provenance
+                                .uri
+                                .clone()
+                                .or_else(|| artifact.provenance.repo.clone())
+                                .unwrap_or_else(|| "-".into());
+                            status = copy_status("provenance", &value);
                         }
                     }
                     KeyCode::Char('r') => {
@@ -2332,13 +2566,14 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[derive(Default)]
-struct TuiArtifactState {
-    staged: bool,
-    synced: bool,
+#[derive(Debug, Clone, Default, Serialize)]
+struct LocalPayloadState {
+    has_local_record: bool,
+    present: bool,
+    verified: bool,
     stale: bool,
     expected_local_path: Option<String>,
-    local_path: Option<String>,
+    recorded_local_path: Option<String>,
 }
 
 struct TuiTask {
@@ -2350,39 +2585,64 @@ enum TaskUpdate {
     Finished(Result<String, String>),
 }
 
-fn tui_artifact_state(
-    repo: &RepoPaths,
-    payloads: &PayloadPaths,
-    metadata: &LocalMetadata,
+impl LocalPayloadState {
+    fn status_label(&self) -> &'static str {
+        if self.verified {
+            "verified"
+        } else if self.stale {
+            "stale"
+        } else if self.present {
+            "present"
+        } else {
+            "missing"
+        }
+    }
+}
+
+fn local_record_for_artifact<'a>(
+    metadata: &'a LocalMetadata,
     artifact: &Artifact,
-) -> TuiArtifactState {
-    let staged = artifact.staged_path(repo).is_file();
-    let dest = payloads.destination_for(artifact).ok();
-    let expected_dest = dest.as_ref().map(|p| p.display().to_string());
-    let record = metadata.artifacts.iter().find(|m| {
+) -> Option<&'a LocalArtifactRecord> {
+    metadata.artifacts.iter().find(|m| {
         m.filename == artifact.filename
             && m.platform == artifact.platform
             && m.category == artifact.category
-    });
-    let local_path = record
-        .map(|record| record.local_path.clone())
-        .or_else(|| expected_dest.clone().filter(|p| Path::new(p).is_file()));
-    let synced = record.is_some_and(|record| {
-        Path::new(&record.local_path).is_file()
+    })
+}
+
+fn local_payload_state(
+    payloads: &PayloadPaths,
+    metadata: &LocalMetadata,
+    artifact: &Artifact,
+) -> LocalPayloadState {
+    let dest = payloads.destination_for(artifact).ok();
+    let expected_dest = dest.as_ref().map(|p| p.display().to_string());
+    let record = local_record_for_artifact(metadata, artifact);
+    let has_local_record = record.is_some();
+    let present = dest.as_ref().is_some_and(|path| path.is_file());
+    let recorded_local_path = record.map(|record| record.local_path.clone());
+
+    let verified = record.is_some_and(|record| {
+        expected_dest
+            .as_ref()
+            .is_some_and(|expected| &record.local_path == expected)
+            && present
+            && dest
+                .as_ref()
+                .and_then(|path| sha256_hex(path).ok())
+                .is_some_and(|digest| digest == artifact.sha256)
             && record.sha256 == artifact.sha256
             && record.version == artifact.version
-            && expected_dest
-                .as_ref()
-                .is_none_or(|expected| &record.local_path == expected)
     });
-    let stale = !synced && (record.is_some() || dest.as_ref().is_some_and(|path| path.is_file()));
+    let stale = !verified && (has_local_record || present);
 
-    TuiArtifactState {
-        staged,
-        synced,
+    LocalPayloadState {
+        has_local_record,
+        present,
+        verified,
         stale,
         expected_local_path: expected_dest,
-        local_path,
+        recorded_local_path,
     }
 }
 
@@ -2744,6 +3004,179 @@ mod tests {
         }
 
         assert!(matches!(backend, BackendKind::OciRegistry));
+    }
+
+    #[test]
+    fn backend_kind_defaults_to_oci_registry() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-backend-default");
+        let xdg_config_home = temp.path.join("xdg-config");
+        fs::create_dir_all(&xdg_config_home).expect("create empty xdg config home");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("LOCKER_BACKEND");
+        }
+        let backend = BackendKind::from_env();
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert!(matches!(backend, BackendKind::OciRegistry));
+    }
+
+    fn test_payload_paths(root: &Path) -> PayloadPaths {
+        let windows_dir = root.join("windows");
+        let metadata_dir = root.join(".locker");
+        PayloadPaths {
+            root: root.to_path_buf(),
+            linux_dir: root.join("linux"),
+            windows_dir: windows_dir.clone(),
+            windows_bin_dir: windows_dir.join("bin"),
+            windows_scripts_dir: windows_dir.join("scripts"),
+            windows_webshells_dir: windows_dir.join("webshells"),
+            metadata_dir: metadata_dir.clone(),
+            metadata_file: metadata_dir.join("artifacts.json"),
+        }
+    }
+
+    fn sample_artifact(sha256: &str) -> Artifact {
+        Artifact {
+            platform: "linux".into(),
+            category: "bin".into(),
+            filename: "pspy64".into(),
+            version: "v1.2.1".into(),
+            provenance: Provenance {
+                kind: ProvenanceKind::Download,
+                uri: Some("https://example.invalid/pspy64".into()),
+                repo: Some("https://github.com/example/pspy".into()),
+                tag: Some("v1.2.1".into()),
+                commit: None,
+                asset_name: Some("pspy64".into()),
+                archive_path: None,
+                build_method: None,
+                notes: None,
+            },
+            sha256: sha256.into(),
+            object_name: "linux--bin--pspy64".into(),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn example_manifest_uses_new_provenance_schema() {
+        let raw = fs::read_to_string(
+            "/home/exis/projects/personal/oscp/artifact-catalog/examples/artifacts.example.yaml",
+        )
+        .expect("read example manifest");
+        let manifest: Manifest = serde_json::from_str(&raw).expect("parse example manifest");
+
+        assert!(!manifest.artifacts.is_empty());
+        assert!(manifest.artifacts.iter().all(|artifact| !artifact.object_name.is_empty()));
+        assert!(manifest
+            .artifacts
+            .iter()
+            .all(|artifact| matches!(artifact.provenance.kind, ProvenanceKind::Download)));
+    }
+
+    #[test]
+    fn built_artifact_without_pinned_commit_warns() {
+        let artifact = Artifact {
+            platform: "windows".into(),
+            category: "bin".into(),
+            filename: "tool.exe".into(),
+            version: "git-a1b2c3d-x64".into(),
+            provenance: Provenance {
+                kind: ProvenanceKind::Built,
+                uri: None,
+                repo: Some("https://github.com/example/tool".into()),
+                tag: None,
+                commit: None,
+                asset_name: Some("tool.exe".into()),
+                archive_path: None,
+                build_method: Some("cargo build --release".into()),
+                notes: None,
+            },
+            sha256: "deadbeef".into(),
+            object_name: "windows--bin--tool.exe".into(),
+            active: true,
+        };
+
+        let warnings = artifact_provenance_warnings(&artifact);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("provenance.commit"));
+    }
+
+    #[test]
+    fn prompt_required_requires_explicit_value_in_yes_mode() {
+        let err = prompt_required("version", None, true).expect_err("version should be required");
+        assert!(err.to_string().contains("missing required version"));
+    }
+
+    #[test]
+    fn local_payload_state_marks_verified_file() {
+        let temp = TestDir::new("artifact-catalog-local-verified");
+        let payloads = test_payload_paths(&temp.path);
+        payloads.ensure_dirs().expect("create payload dirs");
+        let expected_bytes = b"expected-bytes";
+        let expected_sha = format!("{:x}", Sha256::digest(expected_bytes));
+        let artifact = sample_artifact(&expected_sha);
+        let dest = payloads
+            .destination_for(&artifact)
+            .expect("resolve destination");
+        fs::write(&dest, expected_bytes).expect("write expected payload");
+        let metadata = LocalMetadata {
+            artifacts: vec![LocalArtifactRecord {
+                filename: artifact.filename.clone(),
+                platform: artifact.platform.clone(),
+                category: artifact.category.clone(),
+                version: artifact.version.clone(),
+                provenance: artifact.provenance.clone(),
+                sha256: artifact.sha256.clone(),
+                object_name: artifact.object_name.clone(),
+                local_path: dest.display().to_string(),
+                synced_at_epoch: 1,
+            }],
+        };
+
+        let state = local_payload_state(&payloads, &metadata, &artifact);
+
+        assert!(state.present);
+        assert!(state.verified);
+        assert!(!state.stale);
+    }
+
+    #[test]
+    fn local_payload_state_marks_tampered_file_stale() {
+        let temp = TestDir::new("artifact-catalog-local-stale");
+        let payloads = test_payload_paths(&temp.path);
+        payloads.ensure_dirs().expect("create payload dirs");
+        let expected_sha = format!("{:x}", Sha256::digest(b"expected-bytes"));
+        let artifact = sample_artifact(&expected_sha);
+        let dest = payloads
+            .destination_for(&artifact)
+            .expect("resolve destination");
+        fs::write(&dest, b"tampered-bytes").expect("write tampered payload");
+        let metadata = LocalMetadata {
+            artifacts: vec![LocalArtifactRecord {
+                filename: artifact.filename.clone(),
+                platform: artifact.platform.clone(),
+                category: artifact.category.clone(),
+                version: artifact.version.clone(),
+                provenance: artifact.provenance.clone(),
+                sha256: artifact.sha256.clone(),
+                object_name: artifact.object_name.clone(),
+                local_path: dest.display().to_string(),
+                synced_at_epoch: 1,
+            }],
+        };
+
+        let state = local_payload_state(&payloads, &metadata, &artifact);
+
+        assert!(state.present);
+        assert!(!state.verified);
+        assert!(state.stale);
     }
 
     #[test]

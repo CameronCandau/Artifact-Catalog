@@ -76,30 +76,34 @@ def extract_from_tar(archive: Path, wanted_name: str, destination: Path, expecte
 
 def restore_artifact(artifact: dict[str, object], release_dir: Path) -> tuple[bool, str]:
     filename = str(artifact["filename"])
-    source_ref = str(artifact["source_ref"])
-    release_asset_name = str(artifact["release_asset_name"])
+    provenance = artifact.get("provenance") or {}
+    source_url = provenance.get("uri")
+    object_name = str(artifact["object_name"])
     expected_sha = str(artifact["sha256"])
-    destination = release_dir / release_asset_name
+    destination = release_dir / object_name
+    archive_path = provenance.get("archive_path")
 
-    if not source_ref.startswith(("http://", "https://")):
-        return False, f"{filename}: unsupported source_ref for bootstrap: {source_ref}"
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        return False, f"{filename}: unsupported provenance.uri for bootstrap: {source_url}"
 
     with tempfile.TemporaryDirectory(prefix="artifact-bootstrap-") as tmpdir:
         downloaded = Path(tmpdir) / "downloaded"
         try:
-            download(source_ref, downloaded)
+            download(source_url, downloaded)
         except Exception as exc:  # noqa: BLE001
-            return False, f"{filename}: download failed from {source_ref}: {exc}"
+            return False, f"{filename}: download failed from {source_url}: {exc}"
 
         if copy_if_checksum_matches(downloaded, destination, expected_sha):
             return True, f"{filename}: restored from direct download"
 
         if zipfile.is_zipfile(downloaded):
-            if extract_from_zip(downloaded, filename, destination, expected_sha):
+            wanted_name = str(archive_path) if archive_path else filename
+            if extract_from_zip(downloaded, wanted_name, destination, expected_sha):
                 return True, f"{filename}: restored by extracting matching file from zip source"
 
         if tarfile.is_tarfile(downloaded):
-            if extract_from_tar(downloaded, filename, destination, expected_sha):
+            wanted_name = str(archive_path) if archive_path else filename
+            if extract_from_tar(downloaded, wanted_name, destination, expected_sha):
                 return True, f"{filename}: restored by extracting matching file from tar source"
 
         actual_sha = sha256_file(downloaded)
@@ -111,7 +115,7 @@ def restore_artifact(artifact: dict[str, object], release_dir: Path) -> tuple[bo
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Rebuild staged release assets from manifest source_ref entries."
+        description="Rebuild staged release assets from manifest provenance entries."
     )
     parser.add_argument("--manifest", default="manifests/artifacts.yaml")
     parser.add_argument("--release-dir", default="staging/release-assets")
