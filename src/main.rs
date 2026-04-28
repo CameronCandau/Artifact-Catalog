@@ -202,7 +202,7 @@ impl RepoPaths {
         } else if let Ok(root) = env::var("LOCKER_ROOT") {
             PathBuf::from(root)
         } else if let Some(root) = load_config().ok().and_then(|config| config.catalog_root) {
-            root
+            expand_home_path(root)
         } else if let Some(root) = repo_checkout_root()? {
             root
         } else {
@@ -279,7 +279,7 @@ impl PayloadPaths {
         let root = if let Ok(root) = env::var("PAYLOADS_DIR") {
             PathBuf::from(root)
         } else if let Some(root) = load_config().ok().and_then(|config| config.payloads_dir) {
-            root
+            expand_home_path(root)
         } else {
             home_dir().join("tools/payloads")
         };
@@ -2227,6 +2227,17 @@ fn default_catalog_root() -> PathBuf {
     xdg_data_home().join("artifact-catalog")
 }
 
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        return home_dir().join(stripped);
+    }
+    path
+}
+
 fn load_config() -> Result<AppConfig> {
     let path = config_file_path();
     if !path.exists() {
@@ -2688,6 +2699,30 @@ mod tests {
     }
 
     #[test]
+    fn discover_expands_tilde_catalog_root_from_config() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-config-tilde");
+        let xdg_config_home = temp.path.join("xdg-config");
+        fs::create_dir_all(xdg_config_home.join("artifact-catalog")).expect("create config dir");
+        fs::write(
+            xdg_config_home.join("artifact-catalog/config.yaml"),
+            "{\"catalog_root\":\"~/catalog-root\"}\n",
+        )
+        .expect("write config file");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("LOCKER_ROOT");
+        }
+        let repo = RepoPaths::discover(None).expect("discover root from config");
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(repo.root, home_dir().join("catalog-root"));
+    }
+
+    #[test]
     fn backend_kind_uses_config_default() {
         let _env_guard = env_lock();
         let temp = TestDir::new("artifact-catalog-backend-config");
@@ -2734,5 +2769,29 @@ mod tests {
         }
 
         assert_eq!(payloads.root, payload_root);
+    }
+
+    #[test]
+    fn payload_paths_expand_tilde_from_config() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-payloads-tilde");
+        let xdg_config_home = temp.path.join("xdg-config");
+        fs::create_dir_all(xdg_config_home.join("artifact-catalog")).expect("create config dir");
+        fs::write(
+            xdg_config_home.join("artifact-catalog/config.yaml"),
+            "{\"payloads_dir\":\"~/payload-root\"}\n",
+        )
+        .expect("write config file");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("PAYLOADS_DIR");
+        }
+        let payloads = PayloadPaths::discover().expect("discover payload paths");
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(payloads.root, home_dir().join("payload-root"));
     }
 }
