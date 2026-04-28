@@ -1,0 +1,5 @@
+4b41f36f82db6da8767a0a1c2997c8242d80b2d10a8f1d28c252a9306ec152b5  windows--bin--ligolo-ng_agent_0.8.3_windows_amd64.exe
+6d48618b0221ac8012b40cc788c933f69855e90f417a8d383d82efd78819dbd3  linux--bin--linpeas_linux_amd64
+9a8e9d587b570d4074f1c8317b163aa8d0c566efd88f294d9d85bc7776352a28  windows--bin--GodPotato-net4.exe
+c93f29a5cc1347bdb90e14a12424e6469c8cfea9a20b800bc249755f0043a3bb  linux--bin--pspy64
+ce709770ac09b79ed9894542a140e76a897bf897bd27855e11cc0ece7194114f  windows--bin--winPEASx64.exe

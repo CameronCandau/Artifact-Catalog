@@ -179,12 +179,30 @@ struct RepoPaths {
     release_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AppConfig {
+    catalog_root: Option<PathBuf>,
+    payloads_dir: Option<PathBuf>,
+    default_backend: Option<String>,
+    github_owner: Option<String>,
+    github_repo: Option<String>,
+    github_base_url: Option<String>,
+    github_manifest_url: Option<String>,
+    github_checksums_url: Option<String>,
+    oci_repository: Option<String>,
+    oci_manifest_tag: Option<String>,
+    oci_checksums_tag: Option<String>,
+    oci_plain_http: Option<bool>,
+}
+
 impl RepoPaths {
     fn discover(root_override: Option<&Path>) -> Result<Self> {
         let root = if let Some(root) = root_override {
             root.to_path_buf()
         } else if let Ok(root) = env::var("LOCKER_ROOT") {
             PathBuf::from(root)
+        } else if let Some(root) = load_config().ok().and_then(|config| config.catalog_root) {
+            root
         } else if let Some(root) = repo_checkout_root()? {
             root
         } else {
@@ -258,9 +276,13 @@ struct PayloadPaths {
 
 impl PayloadPaths {
     fn discover() -> Result<Self> {
-        let root = env::var("PAYLOADS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir().join("tools/payloads"));
+        let root = if let Ok(root) = env::var("PAYLOADS_DIR") {
+            PathBuf::from(root)
+        } else if let Some(root) = load_config().ok().and_then(|config| config.payloads_dir) {
+            root
+        } else {
+            home_dir().join("tools/payloads")
+        };
         let windows_dir = root.join("windows");
         let metadata_dir = root.join(".locker");
         Ok(Self {
@@ -308,9 +330,11 @@ enum BackendKind {
 
 impl BackendKind {
     fn from_env() -> Self {
-        match env::var("LOCKER_BACKEND")
-            .unwrap_or_else(|_| "github-releases".into())
-            .as_str()
+        let backend = env::var("LOCKER_BACKEND")
+            .ok()
+            .or_else(|| load_config().ok().and_then(|config| config.default_backend))
+            .unwrap_or_else(|| "github-releases".into());
+        match backend.as_str()
         {
             "oci" | "oci-registry" => Self::OciRegistry,
             _ => Self::GithubReleases,
@@ -337,17 +361,24 @@ const OCI_ARTIFACT_TYPE_CHECKSUMS: &str = "application/vnd.artifact-catalog.chec
 fn github_owner() -> String {
     env::var("ARTIFACT_CATALOG_OWNER")
         .or_else(|_| env::var("GITHUB_OWNER"))
-        .unwrap_or_else(|_| "CameronCandau".into())
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.github_owner))
+        .unwrap_or_else(|| "CameronCandau".into())
 }
 
 fn github_repo() -> String {
     env::var("ARTIFACT_CATALOG_REPO")
         .or_else(|_| env::var("GITHUB_REPO"))
-        .unwrap_or_else(|_| "Artifact-Catalog".into())
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.github_repo))
+        .unwrap_or_else(|| "Artifact-Catalog".into())
 }
 
 fn github_base_url() -> String {
-    env::var("ARTIFACT_CATALOG_BASE_URL").unwrap_or_else(|_| {
+    env::var("ARTIFACT_CATALOG_BASE_URL")
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.github_base_url))
+        .unwrap_or_else(|| {
         format!(
             "https://github.com/{}/{}/releases/latest/download",
             github_owner(),
@@ -358,18 +389,24 @@ fn github_base_url() -> String {
 
 fn github_manifest_url() -> String {
     env::var("ARTIFACT_CATALOG_MANIFEST_URL")
-        .unwrap_or_else(|_| format!("{}/artifacts.yaml", github_base_url()))
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.github_manifest_url))
+        .unwrap_or_else(|| format!("{}/artifacts.yaml", github_base_url()))
 }
 
 fn github_checksums_url() -> String {
     env::var("ARTIFACT_CATALOG_CHECKSUMS_URL")
-        .unwrap_or_else(|_| format!("{}/sha256sums.txt", github_base_url()))
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.github_checksums_url))
+        .unwrap_or_else(|| format!("{}/sha256sums.txt", github_base_url()))
 }
 
 fn oci_repository() -> Result<String> {
     env::var("ARTIFACT_CATALOG_OCI_REPOSITORY")
         .or_else(|_| env::var("OCI_REPOSITORY"))
-        .map_err(|_| {
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.oci_repository))
+        .ok_or_else(|| {
             anyhow!(
                 "OCI repository is required; set ARTIFACT_CATALOG_OCI_REPOSITORY or OCI_REPOSITORY (example: public.ecr.aws/alias/artifact-catalog)"
             )
@@ -379,17 +416,26 @@ fn oci_repository() -> Result<String> {
 fn oci_manifest_tag() -> String {
     env::var("ARTIFACT_CATALOG_OCI_MANIFEST_TAG")
         .or_else(|_| env::var("OCI_MANIFEST_TAG"))
-        .unwrap_or_else(|_| "artifacts-manifest".into())
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.oci_manifest_tag))
+        .unwrap_or_else(|| "artifacts-manifest".into())
 }
 
 fn oci_checksums_tag() -> String {
     env::var("ARTIFACT_CATALOG_OCI_CHECKSUMS_TAG")
         .or_else(|_| env::var("OCI_CHECKSUMS_TAG"))
-        .unwrap_or_else(|_| "artifacts-sha256sums".into())
+        .ok()
+        .or_else(|| load_config().ok().and_then(|config| config.oci_checksums_tag))
+        .unwrap_or_else(|| "artifacts-sha256sums".into())
 }
 
 fn oci_plain_http() -> bool {
-    env_truthy("ARTIFACT_CATALOG_OCI_PLAIN_HTTP") || env_truthy("OCI_PLAIN_HTTP")
+    env_truthy("ARTIFACT_CATALOG_OCI_PLAIN_HTTP")
+        || env_truthy("OCI_PLAIN_HTTP")
+        || load_config()
+            .ok()
+            .and_then(|config| config.oci_plain_http)
+            .unwrap_or(false)
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -2167,8 +2213,28 @@ fn xdg_data_home() -> PathBuf {
         .unwrap_or_else(|_| home_dir().join(".local/share"))
 }
 
+fn xdg_config_home() -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".config"))
+}
+
+fn config_file_path() -> PathBuf {
+    xdg_config_home().join("artifact-catalog/config.yaml")
+}
+
 fn default_catalog_root() -> PathBuf {
     xdg_data_home().join("artifact-catalog")
+}
+
+fn load_config() -> Result<AppConfig> {
+    let path = config_file_path();
+    if !path.exists() {
+        return Ok(AppConfig::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    serde_json::from_str(&raw).context("parsing config file")
 }
 
 fn repo_checkout_root() -> Result<Option<PathBuf>> {
@@ -2480,6 +2546,15 @@ fn tui_prompt_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock env mutex")
+    }
 
     struct TestDir {
         path: PathBuf,
@@ -2549,6 +2624,7 @@ mod tests {
 
     #[test]
     fn default_catalog_root_respects_xdg_data_home() {
+        let _env_guard = env_lock();
         let temp = TestDir::new("artifact-catalog-xdg");
         let xdg_home = temp.path.join("xdg-home");
         fs::create_dir_all(&xdg_home).expect("create xdg home");
@@ -2562,5 +2638,101 @@ mod tests {
         }
 
         assert_eq!(result, xdg_home.join("artifact-catalog"));
+    }
+
+    #[test]
+    fn config_file_path_respects_xdg_config_home() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-config-home");
+        let xdg_home = temp.path.join("xdg-config");
+        fs::create_dir_all(&xdg_home).expect("create xdg config home");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_home);
+        }
+        let result = config_file_path();
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(result, xdg_home.join("artifact-catalog/config.yaml"));
+    }
+
+    #[test]
+    fn discover_uses_catalog_root_from_config() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-config");
+        let xdg_config_home = temp.path.join("xdg-config");
+        let configured_root = temp.path.join("configured-root");
+        fs::create_dir_all(xdg_config_home.join("artifact-catalog")).expect("create config dir");
+        fs::create_dir_all(&configured_root).expect("create configured root");
+        fs::write(
+            xdg_config_home.join("artifact-catalog/config.yaml"),
+            format!(
+                "{{\"catalog_root\":\"{}\"}}\n",
+                configured_root.display()
+            ),
+        )
+        .expect("write config file");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("LOCKER_ROOT");
+        }
+        let repo = RepoPaths::discover(None).expect("discover root from config");
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(repo.root, configured_root);
+    }
+
+    #[test]
+    fn backend_kind_uses_config_default() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-backend-config");
+        let xdg_config_home = temp.path.join("xdg-config");
+        fs::create_dir_all(xdg_config_home.join("artifact-catalog")).expect("create config dir");
+        fs::write(
+            xdg_config_home.join("artifact-catalog/config.yaml"),
+            "{\"default_backend\":\"oci-registry\"}\n",
+        )
+        .expect("write config file");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("LOCKER_BACKEND");
+        }
+        let backend = BackendKind::from_env();
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert!(matches!(backend, BackendKind::OciRegistry));
+    }
+
+    #[test]
+    fn payload_paths_use_config_default() {
+        let _env_guard = env_lock();
+        let temp = TestDir::new("artifact-catalog-payloads-config");
+        let xdg_config_home = temp.path.join("xdg-config");
+        let payload_root = temp.path.join("payload-root");
+        fs::create_dir_all(xdg_config_home.join("artifact-catalog")).expect("create config dir");
+        fs::write(
+            xdg_config_home.join("artifact-catalog/config.yaml"),
+            format!("{{\"payloads_dir\":\"{}\"}}\n", payload_root.display()),
+        )
+        .expect("write config file");
+
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+            env::remove_var("PAYLOADS_DIR");
+        }
+        let payloads = PayloadPaths::discover().expect("discover payload paths");
+        unsafe {
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        assert_eq!(payloads.root, payload_root);
     }
 }
