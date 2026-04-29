@@ -3422,10 +3422,9 @@ mod tests {
 
     #[test]
     fn example_manifest_uses_new_provenance_schema() {
-        let raw = fs::read_to_string(
-            "/home/exis/projects/personal/oscp/artifact-catalog/examples/artifacts.example.yaml",
-        )
-        .expect("read example manifest");
+        let example_manifest =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/artifacts.example.yaml");
+        let raw = fs::read_to_string(&example_manifest).expect("read example manifest");
         let manifest: Manifest = serde_json::from_str(&raw).expect("parse example manifest");
 
         assert!(!manifest.artifacts.is_empty());
