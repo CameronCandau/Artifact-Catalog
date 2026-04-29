@@ -172,8 +172,13 @@ scripts/locker add /path/to/SweetPotato.exe \
   --version git-a1b2c3d-x64 \
   --provenance-kind built \
   --source-repo https://github.com/CCob/SweetPotato \
-  --source-commit a1b2c3d4e5f678901234567890abcdef12345678
+  --source-commit a1b2c3d4e5f678901234567890abcdef12345678 \
+  --build-method "msbuild /p:Configuration=Release"
 ```
+
+For `built` artifacts, `artifact-catalog` now treats `source_repo`,
+`source_commit`, and `build_method` as required metadata. Placeholder values
+are rejected.
 
 ## Variant Naming Convention
 
@@ -304,7 +309,17 @@ The `add` flow:
 - infers `filename`, `provenance.kind`, `provenance.uri`, and release `version` when possible
 - suggests `platform` and `category` from the filename
 - prompts for missing metadata unless you pass it directly
-- supports `-y/--yes` for fast non-interactive adds using inferred/default values
+- supports `-y/--yes` for fast non-interactive adds when the required metadata
+  can be inferred or was passed explicitly
+
+Hard validation rules:
+
+- `download` artifacts must have a real `source_url`
+- `built` artifacts must have a real `source_repo`, pinned `source_commit`, and
+  non-empty `build_method`
+- `object_name` must exactly match `<platform>--<category>--<filename>`
+- placeholder metadata such as `example.invalid` URLs or `OWNER/REPO` values is
+  rejected
 
 If you already built the debug binary, you can run:
 
@@ -450,6 +465,8 @@ What local sync metadata means:
   present/verified/stale view
 - that metadata is operational state, not an integrity attestation for the
   current contents of your payload directory
+- `doctor` also treats malformed manifest metadata, duplicate `object_name`
+  entries, and invalid provenance for the selected kind as catalog problems
 
 Useful overrides:
 

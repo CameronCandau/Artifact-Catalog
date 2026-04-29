@@ -391,8 +391,7 @@ impl BackendKind {
             .ok()
             .or_else(|| load_config().ok().and_then(|config| config.default_backend))
             .unwrap_or_else(|| "oci-registry".into());
-        match backend.as_str()
-        {
+        match backend.as_str() {
             "oci" | "oci-registry" => Self::OciRegistry,
             _ => Self::GithubReleases,
         }
@@ -436,25 +435,33 @@ fn github_base_url() -> String {
         .ok()
         .or_else(|| load_config().ok().and_then(|config| config.github_base_url))
         .unwrap_or_else(|| {
-        format!(
-            "https://github.com/{}/{}/releases/latest/download",
-            github_owner(),
-            github_repo()
-        )
-    })
+            format!(
+                "https://github.com/{}/{}/releases/latest/download",
+                github_owner(),
+                github_repo()
+            )
+        })
 }
 
 fn github_manifest_url() -> String {
     env::var("ARTIFACT_CATALOG_MANIFEST_URL")
         .ok()
-        .or_else(|| load_config().ok().and_then(|config| config.github_manifest_url))
+        .or_else(|| {
+            load_config()
+                .ok()
+                .and_then(|config| config.github_manifest_url)
+        })
         .unwrap_or_else(|| format!("{}/artifacts.yaml", github_base_url()))
 }
 
 fn github_checksums_url() -> String {
     env::var("ARTIFACT_CATALOG_CHECKSUMS_URL")
         .ok()
-        .or_else(|| load_config().ok().and_then(|config| config.github_checksums_url))
+        .or_else(|| {
+            load_config()
+                .ok()
+                .and_then(|config| config.github_checksums_url)
+        })
         .unwrap_or_else(|| format!("{}/sha256sums.txt", github_base_url()))
 }
 
@@ -474,7 +481,11 @@ fn oci_manifest_tag() -> String {
     env::var("ARTIFACT_CATALOG_OCI_MANIFEST_TAG")
         .or_else(|_| env::var("OCI_MANIFEST_TAG"))
         .ok()
-        .or_else(|| load_config().ok().and_then(|config| config.oci_manifest_tag))
+        .or_else(|| {
+            load_config()
+                .ok()
+                .and_then(|config| config.oci_manifest_tag)
+        })
         .unwrap_or_else(|| "artifacts-manifest".into())
 }
 
@@ -482,7 +493,11 @@ fn oci_checksums_tag() -> String {
     env::var("ARTIFACT_CATALOG_OCI_CHECKSUMS_TAG")
         .or_else(|_| env::var("OCI_CHECKSUMS_TAG"))
         .ok()
-        .or_else(|| load_config().ok().and_then(|config| config.oci_checksums_tag))
+        .or_else(|| {
+            load_config()
+                .ok()
+                .and_then(|config| config.oci_checksums_tag)
+        })
         .unwrap_or_else(|| "artifacts-sha256sums".into())
 }
 
@@ -611,7 +626,12 @@ fn validate_manifest_checksums(
     let expected: BTreeMap<String, String> = manifest
         .artifacts
         .iter()
-        .map(|artifact| (artifact.object_name.clone(), artifact.sha256.to_ascii_lowercase()))
+        .map(|artifact| {
+            (
+                artifact.object_name.clone(),
+                artifact.sha256.to_ascii_lowercase(),
+            )
+        })
         .collect();
     if expected.len() != manifest.artifacts.len() {
         bail!("manifest contains duplicate object_name entries");
@@ -649,7 +669,9 @@ fn pull_oci_file(tag: &str, expected_filename: &str) -> Result<Vec<u8>> {
 fn load_remote_oci_manifest() -> Result<Manifest> {
     let raw = String::from_utf8(pull_oci_file(&oci_manifest_tag(), "artifacts.yaml")?)
         .context("remote OCI manifest is not valid UTF-8")?;
-    serde_json::from_str(&raw).context("parsing pulled OCI manifest")
+    let manifest: Manifest = serde_json::from_str(&raw).context("parsing pulled OCI manifest")?;
+    ensure_valid_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 fn load_remote_oci_checksums() -> Result<BTreeMap<String, String>> {
@@ -1006,17 +1028,17 @@ impl SyncBackend for OciRegistryBackend {
 
             upsert_local_metadata(
                 &mut metadata,
-            LocalArtifactRecord {
-                filename: artifact.filename.clone(),
-                platform: artifact.platform.clone(),
-                category: artifact.category.clone(),
-                version: artifact.version.clone(),
-                provenance: artifact.provenance.clone(),
-                sha256: artifact.sha256.clone(),
-                object_name: artifact.object_name.clone(),
-                local_path: dest_path.display().to_string(),
-                synced_at_epoch: now,
-            },
+                LocalArtifactRecord {
+                    filename: artifact.filename.clone(),
+                    platform: artifact.platform.clone(),
+                    category: artifact.category.clone(),
+                    version: artifact.version.clone(),
+                    provenance: artifact.provenance.clone(),
+                    sha256: artifact.sha256.clone(),
+                    object_name: artifact.object_name.clone(),
+                    local_path: dest_path.display().to_string(),
+                    synced_at_epoch: now,
+                },
             );
             println!("[+] synced {step}/{total}: {}", artifact.filename);
         }
@@ -1085,6 +1107,7 @@ fn load_manifest(repo: &RepoPaths) -> Result<Manifest> {
 
 fn save_manifest(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
     repo.ensure_layout()?;
+    ensure_valid_manifest(manifest)?;
     fs::write(
         &repo.manifest,
         serde_json::to_string_pretty(manifest)? + "\n",
@@ -1120,7 +1143,150 @@ fn looks_like_hex_commit(value: &str) -> bool {
     value.len() >= 7 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn artifact_provenance_warnings(artifact: &Artifact) -> Vec<String> {
+fn normalized_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn looks_like_placeholder_repo(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("owner/repo") || lower.contains("example.invalid")
+}
+
+fn looks_like_placeholder_url(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("example.invalid")
+}
+
+fn looks_like_placeholder_text(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || matches!(
+            lower.as_str(),
+            "todo" | "tbd" | "placeholder" | "replace-me" | "example"
+        )
+}
+
+fn derived_object_name(platform: &str, category: &str, filename: &str) -> String {
+    format!("{platform}--{category}--{filename}")
+}
+
+fn looks_like_sha256(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn artifact_metadata_problems(artifact: &Artifact) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    for (field, value) in [
+        ("platform", artifact.platform.as_str()),
+        ("category", artifact.category.as_str()),
+        ("filename", artifact.filename.as_str()),
+        ("version", artifact.version.as_str()),
+        ("object_name", artifact.object_name.as_str()),
+        ("sha256", artifact.sha256.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            problems.push(format!("{} has empty {}", artifact.filename, field));
+        }
+    }
+
+    if !looks_like_sha256(&artifact.sha256) {
+        problems.push(format!(
+            "{} has invalid sha256 metadata: {}",
+            artifact.filename, artifact.sha256
+        ));
+    }
+
+    let expected_object_name =
+        derived_object_name(&artifact.platform, &artifact.category, &artifact.filename);
+    if artifact.object_name != expected_object_name {
+        problems.push(format!(
+            "{} has invalid object_name {}; expected {}",
+            artifact.filename, artifact.object_name, expected_object_name
+        ));
+    }
+    if artifact.object_name.contains('/') || artifact.object_name.contains('\\') {
+        problems.push(format!(
+            "{} object_name must not contain path separators: {}",
+            artifact.filename, artifact.object_name
+        ));
+    }
+    if artifact.object_name.contains("..") {
+        problems.push(format!(
+            "{} object_name must not contain traversal segments: {}",
+            artifact.filename, artifact.object_name
+        ));
+    }
+
+    match artifact.provenance.kind {
+        ProvenanceKind::Download => {
+            let uri = artifact.provenance.uri.as_deref().map(str::trim);
+            if uri.is_none_or(|value| value.is_empty()) {
+                problems.push(format!(
+                    "{} is marked download but provenance.uri is missing",
+                    artifact.filename
+                ));
+            } else if uri.is_some_and(looks_like_placeholder_url) {
+                problems.push(format!(
+                    "{} is marked download but provenance.uri is placeholder-like: {}",
+                    artifact.filename,
+                    artifact.provenance.uri.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+        ProvenanceKind::Built => {
+            let repo = artifact.provenance.repo.as_deref().map(str::trim);
+            if repo.is_none_or(|value| value.is_empty() || looks_like_placeholder_repo(value)) {
+                problems.push(format!(
+                    "{} is marked built but provenance.repo is missing or placeholder-like",
+                    artifact.filename
+                ));
+            }
+            let commit = artifact.provenance.commit.as_deref().map(str::trim);
+            if commit.is_none_or(|value| !looks_like_hex_commit(value) || value == "abcdef1234567")
+            {
+                problems.push(format!(
+                    "{} is marked built but provenance.commit is not pinned",
+                    artifact.filename
+                ));
+            }
+            let build_method = artifact.provenance.build_method.as_deref().map(str::trim);
+            if build_method.is_none_or(looks_like_placeholder_text) {
+                problems.push(format!(
+                    "{} is marked built but build_method is missing",
+                    artifact.filename
+                ));
+            }
+        }
+        ProvenanceKind::Local => {
+            let uri = artifact.provenance.uri.as_deref().map(str::trim);
+            if uri.is_none_or(|value| value.is_empty()) {
+                problems.push(format!(
+                    "{} is marked local but provenance.uri is missing",
+                    artifact.filename
+                ));
+            } else if uri
+                .is_some_and(|value| value.starts_with("http://") || value.starts_with("https://"))
+            {
+                problems.push(format!(
+                    "{} is marked local but provenance.uri is not a local path: {}",
+                    artifact.filename,
+                    artifact.provenance.uri.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    problems
+}
+
+fn artifact_metadata_warnings(artifact: &Artifact) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if is_weak_version(&artifact.version) {
@@ -1130,21 +1296,106 @@ fn artifact_provenance_warnings(artifact: &Artifact) -> Vec<String> {
         ));
     }
 
-    if matches!(artifact.provenance.kind, ProvenanceKind::Built)
-        && artifact
-            .provenance
-            .commit
-            .as_deref()
-            .is_none_or(|commit| !looks_like_hex_commit(commit))
-    {
-        warnings.push(format!(
-            "{} is marked built but provenance.commit is not pinned: {}",
-            artifact.filename,
-            artifact.provenance.commit.as_deref().unwrap_or("<missing>")
-        ));
+    match artifact.provenance.kind {
+        ProvenanceKind::Download => {
+            if artifact
+                .provenance
+                .repo
+                .as_deref()
+                .is_none_or(|repo| repo.trim().is_empty())
+            {
+                warnings.push(format!(
+                    "{} is marked download but provenance.repo is missing",
+                    artifact.filename
+                ));
+            }
+            if artifact
+                .provenance
+                .tag
+                .as_deref()
+                .is_none_or(|tag| tag.trim().is_empty())
+            {
+                warnings.push(format!(
+                    "{} is marked download but provenance.tag is missing",
+                    artifact.filename
+                ));
+            } else if artifact.provenance.tag.as_deref().is_some_and(|tag| {
+                matches!(
+                    tag.trim().to_ascii_lowercase().as_str(),
+                    "latest" | "main" | "master"
+                )
+            }) {
+                warnings.push(format!(
+                    "{} is marked download but provenance.tag is weak: {}",
+                    artifact.filename,
+                    artifact.provenance.tag.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+        ProvenanceKind::Built => {
+            if artifact.provenance.uri.is_none() {
+                warnings.push(format!(
+                    "{} is marked built but provenance.uri is missing",
+                    artifact.filename
+                ));
+            }
+            if artifact
+                .provenance
+                .notes
+                .as_deref()
+                .is_none_or(|notes| notes.trim().is_empty())
+            {
+                warnings.push(format!(
+                    "{} is marked built but notes are missing",
+                    artifact.filename
+                ));
+            }
+        }
+        ProvenanceKind::Local => {
+            if artifact.provenance.repo.is_some()
+                || artifact.provenance.tag.is_some()
+                || artifact.provenance.commit.is_some()
+            {
+                warnings.push(format!(
+                    "{} is marked local but also carries upstream provenance fields",
+                    artifact.filename
+                ));
+            }
+        }
     }
 
     warnings
+}
+
+fn manifest_metadata_problems(manifest: &Manifest) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut object_names = BTreeMap::new();
+
+    for artifact in &manifest.artifacts {
+        problems.extend(artifact_metadata_problems(artifact));
+        *object_names
+            .entry(artifact.object_name.clone())
+            .or_insert(0usize) += 1;
+    }
+
+    for (object_name, count) in object_names {
+        if count > 1 {
+            problems.push(format!(
+                "manifest contains duplicate object_name entries: {} ({count} entries)",
+                object_name
+            ));
+        }
+    }
+
+    problems
+}
+
+fn ensure_valid_manifest(manifest: &Manifest) -> Result<()> {
+    let problems = manifest_metadata_problems(manifest);
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!("manifest validation failed: {}", problems.join("; "));
 }
 
 fn infer_github_repo(source: &str) -> Option<String> {
@@ -1239,10 +1490,7 @@ fn rebuild_checksums(repo: &RepoPaths, manifest: &Manifest) -> Result<()> {
     for artifact in &manifest.artifacts {
         let staged = artifact.staged_path(repo);
         if staged.is_file() {
-            lines.push(format!(
-                "{}  {}",
-                artifact.sha256, artifact.object_name
-            ));
+            lines.push(format!("{}  {}", artifact.sha256, artifact.object_name));
         }
     }
     lines.sort();
@@ -1268,6 +1516,7 @@ where
         .send()?
         .error_for_status()?
         .json()?;
+    ensure_valid_manifest(&manifest)?;
     let checksums = parse_checksums(
         &client
             .get(github_checksums_url())
@@ -1486,77 +1735,71 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
         Some(v) => v,
         None => prompt_required("version", inferred_version, args.yes)?,
     };
+    let source_url = normalized_optional(args.source_url);
+    let source_repo = normalized_optional(args.source_repo);
+    let source_tag = normalized_optional(args.source_tag);
+    let source_commit = normalized_optional(args.source_commit);
+    let archive_path = normalized_optional(args.archive_path);
+    let build_method = normalized_optional(args.build_method);
+    let notes = normalized_optional(args.notes);
     let provenance_kind = match args.provenance_kind.as_deref() {
         Some(value) => parse_provenance_kind(value)?,
         None => inferred_kind,
     };
-    let default_source_url = if source_identity.starts_with("http://")
-        || source_identity.starts_with("https://")
-    {
-        Some(source_identity.clone())
-    } else {
-        None
-    };
+    let default_source_url =
+        if source_identity.starts_with("http://") || source_identity.starts_with("https://") {
+            Some(source_identity.clone())
+        } else {
+            None
+        };
     let provenance = match provenance_kind {
         ProvenanceKind::Download => Provenance {
             kind: ProvenanceKind::Download,
-            uri: Some(match args.source_url {
+            uri: Some(match source_url.clone() {
                 Some(url) => url,
-                None => prompt_or_default(
-                    "source_url",
-                    default_source_url,
-                    "https://example.invalid/download",
-                    args.yes,
-                )?,
+                None => prompt_required("source_url", default_source_url, args.yes)?,
             }),
-            repo: args.source_repo.or_else(|| infer_github_repo(&source_identity)),
-            tag: args.source_tag.or_else(|| infer_version_from_source(&source_identity)),
-            commit: args.source_commit,
+            repo: source_repo.or_else(|| infer_github_repo(&source_identity)),
+            tag: source_tag.or_else(|| infer_version_from_source(&source_identity)),
+            commit: source_commit,
             asset_name: Some(filename.clone()),
-            archive_path: args.archive_path,
-            build_method: args.build_method,
-            notes: args.notes,
+            archive_path,
+            build_method,
+            notes,
         },
         ProvenanceKind::Built => Provenance {
             kind: ProvenanceKind::Built,
-            uri: args.source_url.or(default_source_url),
-            repo: Some(match args.source_repo {
+            uri: source_url.or(default_source_url),
+            repo: Some(match source_repo.clone() {
                 Some(repo) => repo,
-                None => prompt_or_default(
-                    "source_repo",
-                    None,
-                    "https://github.com/OWNER/REPO",
-                    args.yes,
-                )?,
+                None => prompt_required("source_repo", None, args.yes)?,
             }),
-            tag: args.source_tag,
-            commit: Some(match args.source_commit {
+            tag: source_tag,
+            commit: Some(match source_commit.clone() {
                 Some(commit) => commit,
-                None => prompt_or_default(
-                    "source_commit",
-                    None,
-                    "abcdef1234567",
-                    args.yes,
-                )?,
+                None => prompt_required("source_commit", None, args.yes)?,
             }),
             asset_name: Some(filename.clone()),
-            archive_path: args.archive_path,
-            build_method: args.build_method,
-            notes: args.notes,
+            archive_path,
+            build_method: Some(match build_method.clone() {
+                Some(build_method) => build_method,
+                None => prompt_required("build_method", None, args.yes)?,
+            }),
+            notes,
         },
         ProvenanceKind::Local => Provenance {
             kind: ProvenanceKind::Local,
             uri: Some(source_path.display().to_string()),
-            repo: args.source_repo,
-            tag: args.source_tag,
-            commit: args.source_commit,
+            repo: source_repo,
+            tag: source_tag,
+            commit: source_commit,
             asset_name: Some(filename.clone()),
-            archive_path: args.archive_path,
-            build_method: args.build_method,
-            notes: args.notes,
+            archive_path,
+            build_method,
+            notes,
         },
     };
-    let object_name = format!("{platform}--{category}--{filename}");
+    let object_name = derived_object_name(&platform, &category, &filename);
     let dest_path = repo.release_dir.join(&object_name);
     fs::copy(&source_path, &dest_path)?;
     let sha256 = sha256_hex(&dest_path)?;
@@ -1571,8 +1814,16 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
         object_name,
         active: !args.inactive,
     };
+    let artifact_problems = artifact_metadata_problems(&artifact);
+    if !artifact_problems.is_empty() {
+        bail!(
+            "refusing to add invalid artifact metadata: {}",
+            artifact_problems.join("; ")
+        );
+    }
 
     let mut manifest = load_manifest(repo)?;
+    ensure_valid_manifest(&manifest)?;
     let mut updated_existing = false;
     if let Some(existing) = manifest
         .artifacts
@@ -1587,6 +1838,7 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     manifest.artifacts.sort_by(|a, b| {
         (&a.platform, &a.category, &a.filename).cmp(&(&b.platform, &b.category, &b.filename))
     });
+    ensure_valid_manifest(&manifest)?;
     save_manifest(repo, &manifest)?;
     rebuild_checksums(repo, &manifest)?;
 
@@ -1599,7 +1851,7 @@ fn add_command(repo: &RepoPaths, args: AddArgs) -> Result<()> {
     println!("[+] Staged at {}", dest_path.display());
     println!("[+] Version: {}", artifact.version);
     println!("[+] Provenance kind: {}", artifact.provenance.kind.as_str());
-    for warning in artifact_provenance_warnings(&artifact) {
+    for warning in artifact_metadata_warnings(&artifact) {
         println!("[!] {warning}");
     }
     println!("[+] Next: locker verify");
@@ -1818,6 +2070,7 @@ where
     F: FnMut(String),
 {
     let manifest = load_manifest(repo)?;
+    ensure_valid_manifest(&manifest)?;
     let total = manifest.artifacts.len();
     let mut expected = Vec::new();
     for (idx, artifact) in manifest.artifacts.iter().enumerate() {
@@ -1835,10 +2088,7 @@ where
         if digest != artifact.sha256 {
             bail!("sha mismatch for {}", artifact.object_name);
         }
-        expected.push(format!(
-            "{}  {}",
-            artifact.sha256, artifact.object_name
-        ));
+        expected.push(format!("{}  {}", artifact.sha256, artifact.object_name));
     }
     expected.sort();
     let mut actual: Vec<String> = fs::read_to_string(&repo.checksums)
@@ -1881,6 +2131,9 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
     }
     let payloads = PayloadPaths::discover()?;
     let manifest = load_manifest(repo)?;
+    for problem in manifest_metadata_problems(&manifest) {
+        problems.push(problem);
+    }
     let payload_metadata =
         load_local_metadata(&payloads).unwrap_or(LocalMetadata { artifacts: vec![] });
     notes.push(format!("payload root: {}", payloads.root.display()));
@@ -1912,7 +2165,7 @@ fn doctor_command(repo: &RepoPaths) -> Result<()> {
         problems.push(format!("staged asset not tracked in manifest: {orphan}"));
     }
     for artifact in &manifest.artifacts {
-        warnings.extend(artifact_provenance_warnings(artifact));
+        warnings.extend(artifact_metadata_warnings(artifact));
         let local_state = local_payload_state(&payloads, &payload_metadata, artifact);
         if local_state.present && !local_state.has_local_record {
             problems.push(format!(
@@ -2102,14 +2355,25 @@ fn tui_command(repo: &RepoPaths) -> Result<()> {
                     Line::from(format!("platform: {}", artifact.platform)),
                     Line::from(format!("category: {}", artifact.category)),
                     Line::from(format!("version: {}", artifact.version)),
-                    Line::from(format!("provenance_kind: {}", artifact.provenance.kind.as_str())),
+                    Line::from(format!(
+                        "provenance_kind: {}",
+                        artifact.provenance.kind.as_str()
+                    )),
                     Line::from(format!(
                         "provenance_uri: {}",
-                        artifact.provenance.uri.clone().unwrap_or_else(|| "-".into())
+                        artifact
+                            .provenance
+                            .uri
+                            .clone()
+                            .unwrap_or_else(|| "-".into())
                     )),
                     Line::from(format!(
                         "provenance_repo: {}",
-                        artifact.provenance.repo.clone().unwrap_or_else(|| "-".into())
+                        artifact
+                            .provenance
+                            .repo
+                            .clone()
+                            .unwrap_or_else(|| "-".into())
                     )),
                     Line::from(format!(
                         "provenance_commit: {}",
@@ -2969,10 +3233,13 @@ mod tests {
         let temp = TestDir::new("artifact-catalog-missing");
         let repo = RepoPaths::from_root(temp.path.clone());
 
-        let err = repo.ensure_initialized().expect_err("missing layout should fail");
-        assert!(err
-            .to_string()
-            .contains("locker catalog is not initialized"));
+        let err = repo
+            .ensure_initialized()
+            .expect_err("missing layout should fail");
+        assert!(
+            err.to_string()
+                .contains("locker catalog is not initialized")
+        );
     }
 
     #[test]
@@ -3032,10 +3299,7 @@ mod tests {
         fs::create_dir_all(&configured_root).expect("create configured root");
         fs::write(
             xdg_config_home.join("artifact-catalog/config.yaml"),
-            format!(
-                "{{\"catalog_root\":\"{}\"}}\n",
-                configured_root.display()
-            ),
+            format!("{{\"catalog_root\":\"{}\"}}\n", configured_root.display()),
         )
         .expect("write config file");
 
@@ -3141,7 +3405,7 @@ mod tests {
             version: "v1.2.1".into(),
             provenance: Provenance {
                 kind: ProvenanceKind::Download,
-                uri: Some("https://example.invalid/pspy64".into()),
+                uri: Some("https://github.com/example/pspy/releases/download/v1.2.1/pspy64".into()),
                 repo: Some("https://github.com/example/pspy".into()),
                 tag: Some("v1.2.1".into()),
                 commit: None,
@@ -3165,15 +3429,22 @@ mod tests {
         let manifest: Manifest = serde_json::from_str(&raw).expect("parse example manifest");
 
         assert!(!manifest.artifacts.is_empty());
-        assert!(manifest.artifacts.iter().all(|artifact| !artifact.object_name.is_empty()));
-        assert!(manifest
-            .artifacts
-            .iter()
-            .all(|artifact| matches!(artifact.provenance.kind, ProvenanceKind::Download)));
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.object_name.is_empty())
+        );
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .all(|artifact| matches!(artifact.provenance.kind, ProvenanceKind::Download))
+        );
     }
 
     #[test]
-    fn built_artifact_without_pinned_commit_warns() {
+    fn built_artifact_without_notes_warns() {
         let artifact = Artifact {
             platform: "windows".into(),
             category: "bin".into(),
@@ -3190,20 +3461,112 @@ mod tests {
                 build_method: Some("cargo build --release".into()),
                 notes: None,
             },
-            sha256: "deadbeef".into(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             object_name: "windows--bin--tool.exe".into(),
             active: true,
         };
 
-        let warnings = artifact_provenance_warnings(&artifact);
+        let warnings = artifact_metadata_warnings(&artifact);
+
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("provenance.uri is missing"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("notes are missing"))
+        );
+    }
+
+    #[test]
+    fn built_artifact_without_pinned_commit_is_invalid() {
+        let artifact = Artifact {
+            platform: "windows".into(),
+            category: "bin".into(),
+            filename: "tool.exe".into(),
+            version: "git-a1b2c3d-x64".into(),
+            provenance: Provenance {
+                kind: ProvenanceKind::Built,
+                uri: Some("/tmp/tool.exe".into()),
+                repo: Some("https://github.com/example/tool".into()),
+                tag: None,
+                commit: None,
+                asset_name: Some("tool.exe".into()),
+                archive_path: None,
+                build_method: Some("cargo build --release".into()),
+                notes: Some("built locally".into()),
+            },
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            object_name: "windows--bin--tool.exe".into(),
+            active: true,
+        };
+
+        let problems = artifact_metadata_problems(&artifact);
+
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("provenance.commit"));
+    }
+
+    #[test]
+    fn local_artifact_with_upstream_fields_warns() {
+        let artifact = Artifact {
+            platform: "windows".into(),
+            category: "bin".into(),
+            filename: "tool.exe".into(),
+            version: "2026.04.28".into(),
+            provenance: Provenance {
+                kind: ProvenanceKind::Local,
+                uri: Some("/tmp/tool.exe".into()),
+                repo: Some("https://github.com/example/tool".into()),
+                tag: Some("v1.0.0".into()),
+                commit: Some("a1b2c3d".into()),
+                asset_name: Some("tool.exe".into()),
+                archive_path: None,
+                build_method: None,
+                notes: None,
+            },
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            object_name: "windows--bin--tool.exe".into(),
+            active: true,
+        };
+
+        let warnings = artifact_metadata_warnings(&artifact);
 
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("provenance.commit"));
+        assert!(warnings[0].contains("upstream provenance fields"));
+    }
+
+    #[test]
+    fn manifest_with_duplicate_object_name_is_invalid() {
+        let artifact =
+            sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let manifest = Manifest {
+            artifacts: vec![artifact.clone(), artifact],
+        };
+
+        let err = ensure_valid_manifest(&manifest).expect_err("duplicate object_name should fail");
+        assert!(err.to_string().contains("duplicate object_name"));
+    }
+
+    #[test]
+    fn manifest_with_placeholder_download_url_is_invalid() {
+        let mut artifact =
+            sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        artifact.provenance.uri = Some("https://example.invalid/download".into());
+
+        let problems = artifact_metadata_problems(&artifact);
+
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("placeholder-like"));
     }
 
     #[test]
     fn parse_checksums_and_validate_manifest_round_trip() {
-        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let artifact =
+            sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let manifest = Manifest {
             artifacts: vec![artifact.clone()],
         };
@@ -3215,7 +3578,8 @@ mod tests {
 
     #[test]
     fn validate_manifest_checksums_rejects_mismatch() {
-        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let artifact =
+            sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let manifest = Manifest {
             artifacts: vec![artifact],
         };
@@ -3226,12 +3590,16 @@ mod tests {
 
         let err =
             validate_manifest_checksums(&manifest, &checksums).expect_err("mismatch should fail");
-        assert!(err.to_string().contains("checksum file does not match manifest"));
+        assert!(
+            err.to_string()
+                .contains("checksum file does not match manifest")
+        );
     }
 
     #[test]
     fn pulled_oci_path_uses_object_name() {
-        let artifact = sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let artifact =
+            sample_artifact("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let output_dir = PathBuf::from("/tmp/pull-output");
 
         assert_eq!(
@@ -3252,7 +3620,10 @@ mod tests {
 
         assert_eq!(
             manifest_tags,
-            vec!["artifacts-manifest".to_string(), "v2026-04-28-manifest".to_string()]
+            vec![
+                "artifacts-manifest".to_string(),
+                "v2026-04-28-manifest".to_string()
+            ]
         );
         assert_eq!(
             checksum_tags,
@@ -3323,6 +3694,59 @@ mod tests {
                 sha256: artifact.sha256.clone(),
                 object_name: artifact.object_name.clone(),
                 local_path: dest.display().to_string(),
+                synced_at_epoch: 1,
+            }],
+        };
+
+        let state = local_payload_state(&payloads, &metadata, &artifact);
+
+        assert!(state.present);
+        assert!(!state.verified);
+        assert!(state.stale);
+    }
+
+    #[test]
+    fn local_payload_state_marks_present_file_without_metadata_stale() {
+        let temp = TestDir::new("artifact-catalog-local-untracked");
+        let payloads = test_payload_paths(&temp.path);
+        payloads.ensure_dirs().expect("create payload dirs");
+        let expected_bytes = b"expected-bytes";
+        let expected_sha = format!("{:x}", Sha256::digest(expected_bytes));
+        let artifact = sample_artifact(&expected_sha);
+        let dest = payloads
+            .destination_for(&artifact)
+            .expect("resolve destination");
+        fs::write(&dest, expected_bytes).expect("write payload");
+
+        let state = local_payload_state(&payloads, &LocalMetadata { artifacts: vec![] }, &artifact);
+
+        assert!(state.present);
+        assert!(!state.verified);
+        assert!(state.stale);
+    }
+
+    #[test]
+    fn local_payload_state_marks_metadata_path_mismatch_stale() {
+        let temp = TestDir::new("artifact-catalog-local-path-mismatch");
+        let payloads = test_payload_paths(&temp.path);
+        payloads.ensure_dirs().expect("create payload dirs");
+        let expected_bytes = b"expected-bytes";
+        let expected_sha = format!("{:x}", Sha256::digest(expected_bytes));
+        let artifact = sample_artifact(&expected_sha);
+        let dest = payloads
+            .destination_for(&artifact)
+            .expect("resolve destination");
+        fs::write(&dest, expected_bytes).expect("write payload");
+        let metadata = LocalMetadata {
+            artifacts: vec![LocalArtifactRecord {
+                filename: artifact.filename.clone(),
+                platform: artifact.platform.clone(),
+                category: artifact.category.clone(),
+                version: artifact.version.clone(),
+                provenance: artifact.provenance.clone(),
+                sha256: artifact.sha256.clone(),
+                object_name: artifact.object_name.clone(),
+                local_path: temp.path.join("somewhere-else").display().to_string(),
                 synced_at_epoch: 1,
             }],
         };

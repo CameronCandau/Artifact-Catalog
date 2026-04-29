@@ -99,7 +99,9 @@ Auth model:
 Integrity model:
 
 - `locker publish` always runs `locker verify` first
-- `locker verify` only proves the local staged catalog is internally consistent
+- `locker verify` rejects duplicate `object_name` entries, malformed manifest
+  metadata, invalid provenance for the declared kind, and checksum drift in the
+  staged release assets
 - publish does not currently perform a post-upload round-trip verification of remote contents
 - sync verifies each downloaded artifact against the manifest `sha256`
 - local `.locker/artifacts.json` records sync state for operator workflows; it is not a tamper-evident store
